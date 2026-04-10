@@ -10,6 +10,10 @@
 - 以统一事件流观察任务生命周期
 - 用真实 Claude 调用做端到端验收
 
+当前仓库已经同时包含：
+- TypeScript 参考实现
+- 面向 Cteno 嵌入场景的 Rust 协议与运行时实现
+
 当前实现是 Claude-first，但协议本身是为后续接入 Cteno 原生 adapter 预留的。
 
 ## 它解决什么问题
@@ -160,6 +164,18 @@ npm test
 npm run clean
 ```
 
+### Rust Workspace
+
+```bash
+cd rust
+cargo test
+```
+
+当前 Rust crates：
+- `multi-agent-protocol`
+- `multi-agent-runtime-core`
+- `multi-agent-runtime-cteno`
+
 ## Smoke 命令
 
 这些命令适合人工观察行为，但不作为发布质量门槛。
@@ -251,6 +267,12 @@ Claude adapter 目前已经做到：
 - 统一的 `dispatch.*` 事件
 - Claude 最终文本结果会回挂到 dispatch 的 `resultText`
 - 三个内置模板都具备通过的 live e2e
+
+Rust 侧目前已经做到：
+- provider-neutral 协议类型
+- 核心 dispatch 生命周期 runtime
+- Cteno adapter 的 trait 与 bootstrap 流程
+- `cargo test` 已通过
 
 所以它已经足够进入开源孵化阶段，并可以作为后续接入 Cteno adapter 的基础。
 

@@ -10,6 +10,10 @@ This package gives us one unified protocol for:
 - observing task lifecycle as events
 - validating generated artifacts in end-to-end tests
 
+The repository now contains:
+- a TypeScript reference implementation
+- a Rust protocol/core implementation intended for embedding into Cteno
+
 The current adapter is Claude-first, but the protocol is intentionally generic enough to support a future Cteno-native adapter.
 
 ## What It Does
@@ -160,6 +164,18 @@ npm test
 npm run clean
 ```
 
+### Rust Workspace
+
+```bash
+cd rust
+cargo test
+```
+
+Rust crates:
+- `multi-agent-protocol`
+- `multi-agent-runtime-core`
+- `multi-agent-runtime-cteno`
+
 ## Smoke Commands
 
 These are useful for manual exploration, but they are not our release-quality validation layer.
@@ -251,6 +267,12 @@ Current status for the Claude adapter:
 - delegated role tasks produce normalized `dispatch.*` events
 - final result text is attached back onto the dispatch as `resultText`
 - all three built-in templates have passing live e2e coverage
+
+Current status for the Rust side:
+- provider-neutral protocol types implemented
+- core dispatch lifecycle runtime implemented
+- Cteno adapter traits and bootstrap flow implemented
+- `cargo test` passes for protocol/core/cteno workspace
 
 That makes this package good enough to continue hardening toward an open-source split, with Cteno integration as the next adapter layer.
 

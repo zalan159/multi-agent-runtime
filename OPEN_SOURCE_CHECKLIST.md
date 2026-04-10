@@ -5,6 +5,7 @@ This is the current hardening checklist before splitting `multi-agent-runtime` i
 ## Done
 
 - Claude Agent SDK adapter implemented
+- Rust workspace scaffold implemented
 - Unified workspace / role / dispatch event model implemented
 - Three built-in templates implemented:
   - `Coding Studio`
