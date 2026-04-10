@@ -2,18 +2,27 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 
-import { ClaudeAgentWorkspace, createAutoresearchWorkspace } from '../../dist/index.js';
+import {
+  ClaudeAgentWorkspace,
+  createAutoresearchTemplate,
+  createClaudeWorkspaceProfile,
+  instantiateWorkspace,
+} from '../../dist/index.js';
 import { countMarkdownLinks, createScratchDir, runWorkspaceScenario } from './_shared.mjs';
 
 test('autoresearch e2e delegates to scout, uses research workflow, and writes a sourced brief', { timeout: 360_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-autoresearch');
   const outputFile = path.join(cwd, 'research/10-scout/mention-patterns.md');
   const workspace = new ClaudeAgentWorkspace({
-    spec: createAutoresearchWorkspace({
-      id: `autoresearch-e2e-${Date.now()}`,
-      name: 'Autoresearch E2E',
-      cwd,
-    }),
+    spec: instantiateWorkspace(
+      createAutoresearchTemplate(),
+      {
+        id: `autoresearch-e2e-${Date.now()}`,
+        name: 'Autoresearch E2E',
+        cwd,
+      },
+      createClaudeWorkspaceProfile(),
+    ),
   });
 
   const { dispatch, events, fileText } = await runWorkspaceScenario({

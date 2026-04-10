@@ -2,7 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-一个面向多 Agent 协作场景的轻量运行时，目前首先对接官方 Claude Agent SDK。
+一个面向多 Agent 协作场景的轻量运行时，目前已经对接官方 Claude Agent SDK 和 Codex SDK。
 
 这套包的目标不是再造一个通用图编排框架，而是提供一层统一协议，用来完成这些事：
 - 定义角色型 Agent
@@ -14,7 +14,11 @@
 - TypeScript 参考实现
 - 面向 Cteno 嵌入场景的 Rust 协议与运行时实现
 
-当前实现是 Claude-first，但协议本身是为后续接入 Cteno 原生 adapter 预留的。
+当前已经有两套 adapter：
+- `ClaudeAgentWorkspace`：对接 Anthropic Claude Agent SDK
+- `CodexSdkWorkspace`：对接 OpenAI Codex SDK
+
+协议本身仍然是为后续接入 Cteno 原生 adapter 预留的。
 
 ## 它解决什么问题
 
@@ -79,28 +83,36 @@
 ## 安装
 
 ```bash
-npm install @anthropic-ai/claude-agent-sdk
+npm install @anthropic-ai/claude-agent-sdk @openai/codex-sdk
 ```
 
 当前假设：
 - Node `>=20`
 - 本机已经可以正常使用 Claude Code / Claude Agent SDK
+- 本机已经可以正常使用 Codex CLI / Codex SDK
 - 本地已经完成 Claude 认证
+- 本地已经完成 Codex 认证
 
 ## 快速开始
 
 ```ts
 import {
   ClaudeAgentWorkspace,
-  createCodingStudioWorkspace,
+  createClaudeWorkspaceProfile,
+  createCodingStudioTemplate,
+  instantiateWorkspace,
 } from '@cteno/multi-agent-runtime';
 
 const workspace = new ClaudeAgentWorkspace({
-  spec: createCodingStudioWorkspace({
-    id: 'demo-coding-studio',
-    name: 'Demo Coding Studio',
-    cwd: process.cwd(),
-  }),
+  spec: instantiateWorkspace(
+    createCodingStudioTemplate(),
+    {
+      id: 'demo-coding-studio',
+      name: 'Demo Coding Studio',
+      cwd: process.cwd(),
+    },
+    createClaudeWorkspaceProfile(),
+  ),
 });
 
 workspace.onEvent(event => {
@@ -114,6 +126,46 @@ const dispatch = await workspace.runRoleTask({
   summary: '起草群聊 @mention 的 PRD',
   instruction:
     'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
+});
+
+console.log(dispatch.status);
+console.log(dispatch.resultText);
+await workspace.close();
+```
+
+### Codex SDK 示例
+
+```ts
+import {
+  CodexSdkWorkspace,
+  createCodingStudioTemplate,
+  createCodexWorkspaceProfile,
+  instantiateWorkspace,
+} from '@cteno/multi-agent-runtime';
+
+const workspace = new CodexSdkWorkspace({
+  spec: instantiateWorkspace(
+    createCodingStudioTemplate(),
+    {
+      id: 'demo-codex-coding-studio',
+      name: 'Demo Codex Coding Studio',
+      cwd: process.cwd(),
+    },
+    createCodexWorkspaceProfile({
+      model: 'gpt-5.1-codex-mini',
+    }),
+  ),
+  skipGitRepoCheck: true,
+  approvalPolicy: 'never',
+  sandboxMode: 'workspace-write',
+});
+
+await workspace.start();
+const dispatch = await workspace.runRoleTask({
+  roleId: 'prd',
+  summary: '起草群聊 @mention 的 PRD',
+  instruction:
+    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature.',
 });
 
 console.log(dispatch.status);
@@ -201,6 +253,7 @@ npm run smoke:autoresearch
 
 ```bash
 npm run e2e:coding
+npm run e2e:codex
 npm run e2e:opc
 npm run e2e:autoresearch
 ```
@@ -218,6 +271,12 @@ npm run e2e
 - 使用的是 `prd` 角色
 - 生成了 `10-prd/group-mentions.md`
 - 文件包含 `Goal`、`User Story`、`Scope`、`Non-Goals`（或语义等价写法）、`Acceptance Criteria`
+
+#### Codex Coding Studio
+检查：
+- `CodexSdkWorkspace` 能复用 role thread
+- `prd` 角色会生成 `10-prd/group-mentions.md`
+- 生成的 PRD 包含预期章节
 - 输出足够简洁，适合继续交付
 
 #### OPC Solo Company

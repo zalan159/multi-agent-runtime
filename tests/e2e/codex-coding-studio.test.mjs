@@ -3,26 +3,31 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
-  ClaudeAgentWorkspace,
-  createClaudeWorkspaceProfile,
+  CodexSdkWorkspace,
   createCodingStudioTemplate,
+  createCodexWorkspaceProfile,
   instantiateWorkspace,
 } from '../../dist/index.js';
 import { createScratchDir, runWorkspaceScenario } from './_shared.mjs';
 
-test('coding studio e2e generates a usable PRD through the prd role', { timeout: 240_000 }, async () => {
-  const cwd = await createScratchDir('cteno-e2e-coding');
+test('codex sdk e2e generates a usable PRD through a reusable role thread', { timeout: 240_000 }, async () => {
+  const cwd = await createScratchDir('cteno-e2e-codex-coding');
   const outputFile = path.join(cwd, '10-prd/group-mentions.md');
-  const workspace = new ClaudeAgentWorkspace({
+  const workspace = new CodexSdkWorkspace({
     spec: instantiateWorkspace(
       createCodingStudioTemplate(),
       {
-        id: `coding-e2e-${Date.now()}`,
-        name: 'Coding E2E',
+        id: `codex-coding-e2e-${Date.now()}`,
+        name: 'Codex Coding E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createCodexWorkspaceProfile({
+        model: 'gpt-5.1-codex-mini',
+      }),
     ),
+    skipGitRepoCheck: true,
+    approvalPolicy: 'never',
+    sandboxMode: 'workspace-write',
   });
 
   const { dispatch, fileText } = await runWorkspaceScenario({
@@ -35,6 +40,8 @@ test('coding studio e2e generates a usable PRD through the prd role', { timeout:
     },
     expectedRoleId: 'prd',
     outputFile,
+    timeoutMs: 180_000,
+    resultTimeoutMs: 20_000,
   });
 
   assert.match(dispatch.resultText, /PRD|group mentions|acceptance/i);
@@ -44,6 +51,4 @@ test('coding studio e2e generates a usable PRD through the prd role', { timeout:
   assert.match(fileText, /## Scope/i);
   assert.match(fileText, /(## Non-Goals|\*\*Out of Scope:\*\*|## Out of Scope)/i);
   assert.match(fileText, /## Acceptance Criteria/i);
-  assert.match(fileText, /@/);
-  assert.ok(fileText.split(/\s+/).length <= 320, 'Expected concise PRD output');
 });

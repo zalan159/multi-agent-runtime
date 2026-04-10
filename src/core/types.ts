@@ -1,4 +1,4 @@
-export type MultiAgentProvider = 'claude-agent-sdk';
+export type MultiAgentProvider = 'claude-agent-sdk' | 'codex-sdk';
 
 export type PermissionMode =
   | 'default'

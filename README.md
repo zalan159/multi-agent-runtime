@@ -2,7 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-A small, extraction-friendly runtime for running role-based multi-agent workspaces on top of the official Claude Agent SDK.
+A small, extraction-friendly runtime for running role-based multi-agent workspaces on top of the official Claude Agent SDK and Codex SDK.
 
 This package gives us one unified protocol for:
 - defining role agents
@@ -14,7 +14,11 @@ The repository now contains:
 - a TypeScript reference implementation
 - a Rust protocol/core implementation intended for embedding into Cteno
 
-The current adapter is Claude-first, but the protocol is intentionally generic enough to support a future Cteno-native adapter.
+The current adapters are:
+- `ClaudeAgentWorkspace` for Anthropic Claude Agent SDK
+- `CodexSdkWorkspace` for OpenAI Codex SDK
+
+The protocol is intentionally generic enough to support a future Cteno-native adapter.
 
 ## What It Does
 
@@ -79,28 +83,36 @@ Typical outcome:
 ## Install
 
 ```bash
-npm install @anthropic-ai/claude-agent-sdk
+npm install @anthropic-ai/claude-agent-sdk @openai/codex-sdk
 ```
 
 This package currently assumes:
 - Node `>=20`
 - a working Claude Code / Claude Agent SDK environment
+- a working Codex CLI / Codex SDK environment
 - local Claude authentication already configured on the machine running the tests
+- local Codex authentication already configured on the machine running the tests
 
 ## Quick Start
 
 ```ts
 import {
   ClaudeAgentWorkspace,
-  createCodingStudioWorkspace,
+  createClaudeWorkspaceProfile,
+  createCodingStudioTemplate,
+  instantiateWorkspace,
 } from '@cteno/multi-agent-runtime';
 
 const workspace = new ClaudeAgentWorkspace({
-  spec: createCodingStudioWorkspace({
-    id: 'demo-coding-studio',
-    name: 'Demo Coding Studio',
-    cwd: process.cwd(),
-  }),
+  spec: instantiateWorkspace(
+    createCodingStudioTemplate(),
+    {
+      id: 'demo-coding-studio',
+      name: 'Demo Coding Studio',
+      cwd: process.cwd(),
+    },
+    createClaudeWorkspaceProfile(),
+  ),
 });
 
 workspace.onEvent(event => {
@@ -114,6 +126,46 @@ const dispatch = await workspace.runRoleTask({
   summary: 'Draft a PRD for group mentions',
   instruction:
     'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
+});
+
+console.log(dispatch.status);
+console.log(dispatch.resultText);
+await workspace.close();
+```
+
+### Codex SDK Example
+
+```ts
+import {
+  CodexSdkWorkspace,
+  createCodingStudioTemplate,
+  createCodexWorkspaceProfile,
+  instantiateWorkspace,
+} from '@cteno/multi-agent-runtime';
+
+const workspace = new CodexSdkWorkspace({
+  spec: instantiateWorkspace(
+    createCodingStudioTemplate(),
+    {
+      id: 'demo-codex-coding-studio',
+      name: 'Demo Codex Coding Studio',
+      cwd: process.cwd(),
+    },
+    createCodexWorkspaceProfile({
+      model: 'gpt-5.1-codex-mini',
+    }),
+  ),
+  skipGitRepoCheck: true,
+  approvalPolicy: 'never',
+  sandboxMode: 'workspace-write',
+});
+
+await workspace.start();
+const dispatch = await workspace.runRoleTask({
+  roleId: 'prd',
+  summary: 'Draft a PRD for group mentions',
+  instruction:
+    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature.',
 });
 
 console.log(dispatch.status);
@@ -201,6 +253,7 @@ Run them individually:
 
 ```bash
 npm run e2e:coding
+npm run e2e:codex
 npm run e2e:opc
 npm run e2e:autoresearch
 ```
@@ -218,6 +271,12 @@ Checks that:
 - the `prd` role is used
 - `10-prd/group-mentions.md` is created
 - the file contains `Goal`, `User Story`, `Scope`, `Non-Goals`, and `Acceptance Criteria`
+
+#### Codex Coding Studio
+Checks that:
+- the `CodexSdkWorkspace` adapter can reuse a role thread
+- the `prd` role writes `10-prd/group-mentions.md`
+- the generated PRD contains the expected sections
 - the output is concise and implementation-oriented
 
 #### OPC Solo Company

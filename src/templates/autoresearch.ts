@@ -1,23 +1,13 @@
-import type { WorkspaceSpec } from '../core/types.js';
+import type { WorkspaceTemplate } from '../core/templates.js';
 
-export function createAutoresearchWorkspace(params: {
-  id: string;
-  name: string;
-  cwd: string;
-  model?: string;
-}): WorkspaceSpec {
+export function createAutoresearchTemplate(): WorkspaceTemplate {
   return {
-    id: params.id,
-    name: params.name,
-    provider: 'claude-agent-sdk',
-    model: params.model ?? 'claude-sonnet-4-5',
-    cwd: params.cwd,
-    permissionMode: 'acceptEdits',
-    settingSources: ['project'],
-    allowedTools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Bash'],
+    templateId: 'autoresearch',
+    templateName: 'Autoresearch',
+    description: 'A research-oriented workspace for scouting and synthesis.',
+    defaultRoleId: 'lead',
     orchestratorPrompt:
       'You orchestrate an autonomous research workspace. Keep hypotheses explicit, separate evidence from interpretation, and favor compact research artifacts that can feed later evaluation loops.',
-    defaultRoleId: 'lead',
     roles: [
       {
         id: 'lead',
@@ -27,7 +17,7 @@ export function createAutoresearchWorkspace(params: {
           description: 'Frames the research question and decides what evidence is worth collecting next.',
           prompt:
             'You are a research lead. Turn vague topics into testable questions, define success criteria, and keep each loop scoped tightly.',
-          tools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep'],
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep'],
         },
       },
       {
@@ -38,7 +28,7 @@ export function createAutoresearchWorkspace(params: {
           description: 'Collects outside signals, references, and raw observations.',
           prompt:
             'You are a web research scout. Gather high-signal evidence, cite sources inline, and keep notes concise enough for downstream synthesis.',
-          tools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'WebSearch', 'WebFetch'],
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep', 'web_search', 'web_fetch'],
         },
       },
       {
@@ -49,7 +39,7 @@ export function createAutoresearchWorkspace(params: {
           description: 'Turns a hypothesis into a measurable experiment design.',
           prompt:
             'You design small, measurable experiments. Define variables, success metrics, instrumentation, and stopping criteria with minimal ceremony.',
-          tools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'Bash'],
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep', 'shell'],
         },
       },
       {
@@ -60,7 +50,7 @@ export function createAutoresearchWorkspace(params: {
           description: 'Challenges assumptions, spots confounders, and tightens reasoning.',
           prompt:
             'You are a skeptical research critic. Look for weak evidence, missing controls, and untested assumptions before the team moves on.',
-          tools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep'],
+          capabilities: ['read', 'write', 'edit', 'glob', 'grep'],
         },
       },
     ],

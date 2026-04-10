@@ -1,14 +1,23 @@
 import path from 'node:path';
-import { ClaudeAgentWorkspace, createAutoresearchWorkspace } from '../dist/index.js';
+import {
+  ClaudeAgentWorkspace,
+  createAutoresearchTemplate,
+  createClaudeWorkspaceProfile,
+  instantiateWorkspace,
+} from '../dist/index.js';
 import { attachConsoleLogger, createScratchDir, printFileIfExists } from './_shared.mjs';
 
 const cwd = await createScratchDir('cteno-autoresearch');
 const workspace = new ClaudeAgentWorkspace({
-  spec: createAutoresearchWorkspace({
-    id: `autoresearch-${Date.now()}`,
-    name: 'Autoresearch Smoke',
-    cwd,
-  }),
+  spec: instantiateWorkspace(
+    createAutoresearchTemplate(),
+    {
+      id: `autoresearch-${Date.now()}`,
+      name: 'Autoresearch Smoke',
+      cwd,
+    },
+    createClaudeWorkspaceProfile(),
+  ),
 });
 
 const stopLogging = attachConsoleLogger(workspace, 'autoresearch');

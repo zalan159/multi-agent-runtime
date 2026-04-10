@@ -1,14 +1,23 @@
 import path from 'node:path';
-import { ClaudeAgentWorkspace, createCodingStudioWorkspace } from '../dist/index.js';
+import {
+  ClaudeAgentWorkspace,
+  createClaudeWorkspaceProfile,
+  createCodingStudioTemplate,
+  instantiateWorkspace,
+} from '../dist/index.js';
 import { attachConsoleLogger, createScratchDir, printFileIfExists } from './_shared.mjs';
 
 const cwd = await createScratchDir('cteno-coding-studio');
 const workspace = new ClaudeAgentWorkspace({
-  spec: createCodingStudioWorkspace({
-    id: `coding-studio-${Date.now()}`,
-    name: 'Coding Studio Smoke',
-    cwd,
-  }),
+  spec: instantiateWorkspace(
+    createCodingStudioTemplate(),
+    {
+      id: `coding-studio-${Date.now()}`,
+      name: 'Coding Studio Smoke',
+      cwd,
+    },
+    createClaudeWorkspaceProfile(),
+  ),
 });
 
 const stopLogging = attachConsoleLogger(workspace, 'coding');

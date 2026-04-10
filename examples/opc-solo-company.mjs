@@ -1,14 +1,23 @@
 import path from 'node:path';
-import { ClaudeAgentWorkspace, createOpcSoloCompanyWorkspace } from '../dist/index.js';
+import {
+  ClaudeAgentWorkspace,
+  createClaudeWorkspaceProfile,
+  createOpcSoloCompanyTemplate,
+  instantiateWorkspace,
+} from '../dist/index.js';
 import { attachConsoleLogger, createScratchDir, printFileIfExists } from './_shared.mjs';
 
 const cwd = await createScratchDir('cteno-opc');
 const workspace = new ClaudeAgentWorkspace({
-  spec: createOpcSoloCompanyWorkspace({
-    id: `opc-${Date.now()}`,
-    name: 'OPC Solo Company Smoke',
-    cwd,
-  }),
+  spec: instantiateWorkspace(
+    createOpcSoloCompanyTemplate(),
+    {
+      id: `opc-${Date.now()}`,
+      name: 'OPC Solo Company Smoke',
+      cwd,
+    },
+    createClaudeWorkspaceProfile(),
+  ),
 });
 
 const stopLogging = attachConsoleLogger(workspace, 'opc');

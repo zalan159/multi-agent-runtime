@@ -2,18 +2,27 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 
-import { ClaudeAgentWorkspace, createOpcSoloCompanyWorkspace } from '../../dist/index.js';
+import {
+  ClaudeAgentWorkspace,
+  createClaudeWorkspaceProfile,
+  createOpcSoloCompanyTemplate,
+  instantiateWorkspace,
+} from '../../dist/index.js';
 import { createScratchDir, runWorkspaceScenario } from './_shared.mjs';
 
 test('opc e2e generates a finance monthly close checklist through the finance role', { timeout: 240_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-opc');
   const outputFile = path.join(cwd, 'company/10-finance/monthly-close-checklist.md');
   const workspace = new ClaudeAgentWorkspace({
-    spec: createOpcSoloCompanyWorkspace({
-      id: `opc-e2e-${Date.now()}`,
-      name: 'OPC E2E',
-      cwd,
-    }),
+    spec: instantiateWorkspace(
+      createOpcSoloCompanyTemplate(),
+      {
+        id: `opc-e2e-${Date.now()}`,
+        name: 'OPC E2E',
+        cwd,
+      },
+      createClaudeWorkspaceProfile(),
+    ),
   });
 
   const { dispatch, fileText } = await runWorkspaceScenario({
