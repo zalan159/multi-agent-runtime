@@ -1,5 +1,7 @@
 # Multi-Agent Runtime
 
+[English](./README.md) | [简体中文](./README.zh-CN.md)
+
 A small, extraction-friendly runtime for running role-based multi-agent workspaces on top of the official Claude Agent SDK.
 
 This package gives us one unified protocol for:
