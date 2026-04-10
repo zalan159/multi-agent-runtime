@@ -1,0 +1,42 @@
+{
+  "name": "@cteno/multi-agent-runtime",
+  "version": "0.1.0",
+  "description": "Unified multi-agent protocol runtime with a Claude Agent SDK adapter.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke:coding": "npm run build && node ./examples/coding-studio.mjs",
+    "smoke:opc": "npm run build && node ./examples/opc-solo-company.mjs",
+    "smoke:autoresearch": "npm run build && node ./examples/autoresearch.mjs",
+    "e2e:coding": "npm run build && node --test ./tests/e2e/coding-studio.test.mjs",
+    "e2e:opc": "npm run build && node --test ./tests/e2e/opc-solo-company.test.mjs",
+    "e2e:autoresearch": "npm run build && node --test ./tests/e2e/autoresearch.test.mjs",
+    "e2e": "npm run build && node --test --test-concurrency=1 ./tests/e2e/coding-studio.test.mjs ./tests/e2e/opc-solo-company.test.mjs ./tests/e2e/autoresearch.test.mjs",
+    "test": "npm run e2e",
+    "prepublishOnly": "npm run clean && npm run build && npm run typecheck"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.98"
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
