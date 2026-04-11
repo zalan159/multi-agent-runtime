@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{TaskDispatch, WorkspaceSpec, WorkspaceStatus};
+use crate::{
+    ClaimStatus, TaskDispatch, WorkspaceActivity, WorkspaceMember, WorkspaceSpec, WorkspaceStatus,
+    WorkspaceVisibility,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -32,11 +35,25 @@ pub enum WorkspaceEvent {
         workspace_id: String,
         state: WorkspaceStatus,
     },
+    MemberRegistered {
+        timestamp: String,
+        workspace_id: String,
+        member: WorkspaceMember,
+    },
+    MemberStateChanged {
+        timestamp: String,
+        workspace_id: String,
+        member: WorkspaceMember,
+    },
     Message {
         timestamp: String,
         workspace_id: String,
         role: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visibility: Option<WorkspaceVisibility>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +63,15 @@ pub enum WorkspaceEvent {
         timestamp: String,
         workspace_id: String,
         dispatch: TaskDispatch,
+    },
+    DispatchClaimed {
+        timestamp: String,
+        workspace_id: String,
+        dispatch: TaskDispatch,
+        member: WorkspaceMember,
+        claim_status: ClaimStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     DispatchStarted {
         timestamp: String,
@@ -95,6 +121,11 @@ pub enum WorkspaceEvent {
         dispatch: TaskDispatch,
         task_id: String,
         result_text: String,
+    },
+    ActivityPublished {
+        timestamp: String,
+        workspace_id: String,
+        activity: WorkspaceActivity,
     },
     ToolProgress {
         timestamp: String,

@@ -8,9 +8,9 @@ import {
   createCodexWorkspaceProfile,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceScenario } from './_shared.mjs';
+import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
 
-test('codex sdk e2e generates a usable PRD through a reusable role thread', { timeout: 240_000 }, async () => {
+test('codex sdk e2e routes a workspace turn to a reusable prd role thread', { timeout: 240_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-codex-coding');
   const outputFile = path.join(cwd, '10-prd/group-mentions.md');
   const workspace = new CodexSdkWorkspace({
@@ -30,25 +30,21 @@ test('codex sdk e2e generates a usable PRD through a reusable role thread', { ti
     sandboxMode: 'workspace-write',
   });
 
-  const { dispatch, fileText } = await runWorkspaceScenario({
+  const { dispatch, turn, fileText } = await runWorkspaceTurnScenario({
     workspace,
-    task: {
-      roleId: 'prd',
-      summary: 'Create a PRD stub for group mentions',
-      instruction:
-        'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
-    },
+    message:
+      'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
     expectedRoleId: 'prd',
     outputFile,
     timeoutMs: 180_000,
     resultTimeoutMs: 20_000,
   });
 
+  assert.match(turn.plan.responseText, /@prd|PRD/i);
   assert.match(dispatch.resultText, /PRD|group mentions|acceptance/i);
-  assert.match(fileText, /^# /m);
-  assert.match(fileText, /## Goal/i);
-  assert.match(fileText, /## User Story/i);
-  assert.match(fileText, /## Scope/i);
-  assert.match(fileText, /(## Non-Goals|\*\*Out of Scope:\*\*|## Out of Scope)/i);
-  assert.match(fileText, /## Acceptance Criteria/i);
+  assert.match(fileText, /^#{1,2}\s+Goal/im);
+  assert.match(fileText, /^#{1,2}\s+User Story/im);
+  assert.match(fileText, /^#{1,2}\s+Scope/im);
+  assert.match(fileText, /(^#{1,2}\s+Non-Goals|\*\*Out of Scope:\*\*|^#{1,2}\s+Out of Scope)/im);
+  assert.match(fileText, /^#{1,2}\s+Acceptance Criteria/im);
 });

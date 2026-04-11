@@ -14,22 +14,38 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import type {
+  ActivityPublishedEvent,
+  DispatchClaimedEvent,
   DispatchCompletedEvent,
   DispatchResultEvent,
   DispatchProgressEvent,
   DispatchStartedEvent,
+  MemberRegisteredEvent,
+  MemberStateChangedEvent,
   WorkspaceInitializedEvent,
   WorkspaceMessageEvent,
   WorkspaceStateChangedEvent,
 } from '../../core/events.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
+  ClaimStatus,
   RoleSpec,
   RoleTaskRequest,
   TaskDispatch,
+  WorkspaceActivity,
+  WorkspaceActivityKind,
+  WorkspaceMember,
   WorkspaceSpec,
   WorkspaceState,
+  WorkspaceTurnRequest,
+  WorkspaceTurnResult,
+  WorkspaceVisibility,
 } from '../../core/types.js';
+import {
+  buildWorkspaceTurnPrompt,
+  planWorkspaceTurnHeuristically,
+  parseWorkspaceTurnPlan,
+} from '../../core/workspaceTurn.js';
 import { AsyncMessageQueue } from './asyncMessageQueue.js';
 import { extractMessageText, normalizeAgentNames } from './messageUtils.js';
 
@@ -50,6 +66,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
   private readonly inputQueue = new AsyncMessageQueue<SDKUserMessage>();
   private readonly pendingDispatchQueue: string[] = [];
   private readonly pendingResultDispatchQueue: string[] = [];
+  private readonly pendingAssistantVisibilities: WorkspaceVisibility[] = [];
   private readonly taskToDispatch = new Map<string, string>();
   private readonly toolUseToDispatch = new Map<string, string>();
   private readonly state: WorkspaceState;
@@ -75,6 +92,20 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       provider: 'claude-agent-sdk',
       roles: Object.fromEntries(this.spec.roles.map(role => [role.id, role])),
       dispatches: {},
+      members: Object.fromEntries(
+        this.spec.roles.map(role => [
+          role.id,
+          {
+            memberId: role.id,
+            workspaceId: this.spec.id,
+            roleId: role.id,
+            roleName: role.name,
+            ...(role.direct !== undefined ? { direct: role.direct } : {}),
+            status: 'idle',
+          } satisfies WorkspaceMember,
+        ]),
+      ),
+      activities: [],
     };
   }
 
@@ -83,6 +114,8 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       ...this.state,
       roles: { ...this.state.roles },
       dispatches: { ...this.state.dispatches },
+      members: { ...this.state.members },
+      activities: [...this.state.activities],
     };
   }
 
@@ -97,6 +130,15 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       workspaceId: this.spec.id,
       spec: this.spec,
     });
+    for (const member of Object.values(this.state.members)) {
+      const event: MemberRegisteredEvent = {
+        type: 'member.registered',
+        timestamp: new Date().toISOString(),
+        workspaceId: this.spec.id,
+        member: { ...member },
+      };
+      this.emitEvent(event);
+    }
 
     this.query = createClaudeQuery({
       prompt: this.inputQueue,
@@ -120,23 +162,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
 
   async send(message: string): Promise<void> {
     this.ensureStarted();
-
-    const payload = this.createUserMessage(message);
-    this.inputQueue.push(payload);
-
-    const event: WorkspaceMessageEvent = {
-      type: 'message',
-      timestamp: new Date().toISOString(),
-      workspaceId: this.spec.id,
-      role: 'user',
-      text: message,
-      raw: payload,
-      ...(payload.session_id ? { sessionId: payload.session_id } : {}),
-      ...(payload.parent_tool_use_id !== undefined
-        ? { parentToolUseId: payload.parent_tool_use_id }
-        : {}),
-    };
-    this.emitEvent(event);
+    this.pushUserMessage(message, 'public', true);
   }
 
   async assignRoleTask(request: RoleTaskRequest): Promise<TaskDispatch> {
@@ -153,6 +179,16 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       status: 'queued',
       createdAt: new Date().toISOString(),
       ...(request.summary ? { summary: request.summary } : {}),
+      ...(request.visibility ? { visibility: request.visibility } : {}),
+      ...(request.sourceRoleId ? { sourceRoleId: request.sourceRoleId } : {}),
+      ...(this.spec.claimPolicy?.mode !== 'claim'
+        ? {
+            claimStatus: 'claimed' satisfies ClaimStatus,
+            claimedByMemberIds: [role.id],
+          }
+        : {
+            claimStatus: 'pending' satisfies ClaimStatus,
+          }),
     };
 
     this.state.dispatches[dispatch.dispatchId] = dispatch;
@@ -164,8 +200,24 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       workspaceId: this.spec.id,
       dispatch: { ...dispatch },
     });
+    if (dispatch.claimStatus === 'claimed') {
+      const event: DispatchClaimedEvent = {
+        type: 'dispatch.claimed',
+        timestamp: new Date().toISOString(),
+        workspaceId: this.spec.id,
+        dispatch: { ...dispatch },
+        member: this.state.members[role.id]!,
+        claimStatus: 'claimed',
+        note: 'Assigned by policy',
+      };
+      this.emitEvent(event);
+    }
 
-    await this.send(this.buildRoleDispatchPrompt(role, dispatch));
+    this.pushUserMessage(
+      this.buildRoleDispatchPrompt(role, dispatch),
+      dispatch.visibility ?? 'coordinator',
+      false,
+    );
     return { ...dispatch };
   }
 
@@ -174,6 +226,49 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     options: { timeoutMs?: number; resultTimeoutMs?: number } = {},
   ): Promise<TaskDispatch> {
     return this.runDispatch(this.assignRoleTask(request), options);
+  }
+
+  async runWorkspaceTurn(
+    request: WorkspaceTurnRequest,
+    options: { timeoutMs?: number; resultTimeoutMs?: number } = {},
+  ): Promise<WorkspaceTurnResult> {
+    const coordinatorRole = this.resolveCoordinatorRole();
+    if (this.spec.claimPolicy?.mode === 'claim') {
+      this.recordUserMessage(request.message, request.visibility ?? 'public', true);
+    } else {
+      await this.send(request.message);
+    }
+
+    const plan = this.spec.claimPolicy?.mode === 'claim'
+      ? planWorkspaceTurnHeuristically(this.spec, request)
+      : parseWorkspaceTurnPlan(
+          await this.requestCoordinatorPlan(request, options.timeoutMs),
+          this.spec,
+          request,
+        );
+
+    this.emitCoordinatorSummary(plan.responseText, coordinatorRole.id);
+
+    const dispatches: TaskDispatch[] = [];
+    for (const assignment of plan.assignments) {
+      const dispatch = await this.assignRoleTask({
+        roleId: assignment.roleId,
+        instruction: assignment.instruction,
+        ...(assignment.summary ? { summary: assignment.summary } : {}),
+        visibility: assignment.visibility ?? request.visibility ?? 'public',
+        sourceRoleId: coordinatorRole.id,
+      });
+      this.claimDispatch(dispatch.dispatchId, assignment.roleId, 'Claimed by coordinator routing');
+      dispatches.push(
+        await this.runDispatch(Promise.resolve(dispatch), options),
+      );
+    }
+
+    return {
+      request,
+      plan,
+      dispatches,
+    };
   }
 
   async stopTask(taskId: string): Promise<void> {
@@ -297,6 +392,19 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     return lines.join('\n\n');
   }
 
+  private resolveCoordinatorRole(): RoleSpec {
+    const coordinatorRoleId =
+      this.spec.coordinatorRoleId ?? this.spec.defaultRoleId ?? this.spec.roles[0]?.id;
+    if (!coordinatorRoleId) {
+      throw new Error('Workspace has no coordinator role.');
+    }
+    const coordinatorRole = this.state.roles[coordinatorRoleId];
+    if (!coordinatorRole) {
+      throw new Error(`Unknown coordinator role: ${coordinatorRoleId}`);
+    }
+    return coordinatorRole;
+  }
+
   private createUserMessage(message: string): SDKUserMessage {
     const sessionId = this.state.sessionId ?? this.requestedSessionId;
 
@@ -309,6 +417,45 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       parent_tool_use_id: null,
       ...(sessionId ? { session_id: sessionId } : {}),
     };
+  }
+
+  private pushUserMessage(
+    message: string,
+    visibility: WorkspaceVisibility,
+    publishActivity: boolean,
+  ): void {
+    const payload = this.createUserMessage(message);
+    this.inputQueue.push(payload);
+    this.pendingAssistantVisibilities.push(visibility);
+
+    this.recordUserMessage(message, visibility, publishActivity, payload);
+  }
+
+  private recordUserMessage(
+    message: string,
+    visibility: WorkspaceVisibility,
+    publishActivity: boolean,
+    payloadOverride?: SDKUserMessage,
+  ): void {
+    const payload = payloadOverride ?? this.createUserMessage(message);
+
+    const event: WorkspaceMessageEvent = {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      role: 'user',
+      text: message,
+      visibility,
+      raw: payload,
+      ...(payload.session_id ? { sessionId: payload.session_id } : {}),
+      ...(payload.parent_tool_use_id !== undefined
+        ? { parentToolUseId: payload.parent_tool_use_id }
+        : {}),
+    };
+    this.emitEvent(event);
+    if (publishActivity) {
+      this.publishActivity('user_message', message, { visibility });
+    }
   }
 
   private ensureStarted(): void {
@@ -403,6 +550,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     if (!text) {
       return;
     }
+    const visibility = this.pendingAssistantVisibilities.shift() ?? 'public';
 
     const event: WorkspaceMessageEvent = {
       type: 'message',
@@ -410,13 +558,25 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       workspaceId: this.spec.id,
       role: 'assistant',
       text,
+      visibility,
       raw: message,
+      ...(this.spec.coordinatorRoleId ?? this.spec.defaultRoleId
+        ? { memberId: this.spec.coordinatorRoleId ?? this.spec.defaultRoleId }
+        : {}),
       ...(message.session_id ? { sessionId: message.session_id } : {}),
       ...(message.parent_tool_use_id !== undefined
         ? { parentToolUseId: message.parent_tool_use_id }
         : {}),
     };
     this.emitEvent(event);
+    if (visibility === 'public') {
+      this.publishActivity('coordinator_message', text, {
+        visibility: 'public',
+        ...(this.spec.coordinatorRoleId ?? this.spec.defaultRoleId
+          ? { roleId: this.spec.coordinatorRoleId ?? this.spec.defaultRoleId }
+          : {}),
+      });
+    }
   }
 
   private handleToolProgress(message: SDKToolProgressMessage): void {
@@ -500,6 +660,13 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       description: message.description,
     };
     this.emitEvent(event);
+    this.updateMemberState(dispatch.roleId, 'active', message.description, message.task_id);
+    this.publishActivity('dispatch_started', message.description, {
+      roleId: dispatch.roleId,
+      dispatchId: dispatch.dispatchId,
+      taskId: message.task_id,
+      visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+    });
   }
 
   private handleTaskProgress(message: SDKTaskProgressMessage): void {
@@ -524,6 +691,18 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       ...(message.last_tool_name ? { lastToolName: message.last_tool_name } : {}),
     };
     this.emitEvent(event);
+    this.updateMemberState(
+      dispatch.roleId,
+      'active',
+      message.summary ?? message.description,
+      message.task_id,
+    );
+    this.publishActivity('member_progress', message.summary ?? message.description, {
+      roleId: dispatch.roleId,
+      dispatchId: dispatch.dispatchId,
+      taskId: message.task_id,
+      visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+    });
   }
 
   private handleTaskNotification(message: SDKTaskNotificationMessage): void {
@@ -562,6 +741,26 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       summary: message.summary,
     };
     this.emitEvent(event);
+    this.updateMemberState(
+      dispatch.roleId,
+      dispatch.status === 'completed'
+        ? 'idle'
+        : dispatch.status === 'failed'
+          ? 'blocked'
+          : 'waiting',
+      message.summary,
+      message.task_id,
+    );
+    this.publishActivity(
+      dispatch.status === 'completed' ? 'member_delivered' : 'member_summary',
+      message.summary,
+      {
+        roleId: dispatch.roleId,
+        dispatchId: dispatch.dispatchId,
+        taskId: message.task_id,
+        visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      },
+    );
   }
 
   private attachDispatchToTask(taskId: string, description: string): TaskDispatch {
@@ -629,5 +828,141 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       ...(details.sessionId ? { sessionId: details.sessionId } : {}),
     };
     this.emitEvent(initializedEvent);
+  }
+
+  private async requestCoordinatorPlan(
+    request: WorkspaceTurnRequest,
+    timeoutMs = 120_000,
+  ): Promise<string> {
+    const responsePromise = this.waitForEvent(
+      (event): event is WorkspaceMessageEvent =>
+        event.type === 'message' &&
+        event.role === 'assistant' &&
+        event.visibility === 'coordinator',
+      { timeoutMs },
+    );
+
+    this.pushUserMessage(
+      buildWorkspaceTurnPrompt(this.spec, request),
+      'coordinator',
+      false,
+    );
+
+    const response = await responsePromise;
+    return response.text;
+  }
+
+  private emitCoordinatorSummary(text: string, roleId: string): void {
+    const event: WorkspaceMessageEvent = {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      role: 'assistant',
+      text,
+      visibility: 'public',
+      memberId: roleId,
+      raw: {
+        type: 'workspace_turn_summary',
+        roleId,
+      },
+      ...(this.state.sessionId ? { sessionId: this.state.sessionId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('coordinator_message', text, {
+      roleId,
+      visibility: 'public',
+    });
+  }
+
+  private claimDispatch(
+    dispatchId: string,
+    roleId: string,
+    note?: string,
+    claimStatus: ClaimStatus = 'claimed',
+  ): void {
+    const dispatch = this.state.dispatches[dispatchId];
+    const member = this.state.members[roleId];
+    if (!dispatch || !member) {
+      return;
+    }
+
+    dispatch.claimStatus = claimStatus;
+    dispatch.claimedByMemberIds = Array.from(
+      new Set([...(dispatch.claimedByMemberIds ?? []), roleId]),
+    );
+
+    const event: DispatchClaimedEvent = {
+      type: 'dispatch.claimed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      dispatch: { ...dispatch },
+      member: { ...member },
+      claimStatus,
+      ...(note ? { note } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('member_claimed', note ?? `${member.roleName} claimed the task.`, {
+      roleId,
+      dispatchId,
+      visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+    });
+  }
+
+  private updateMemberState(
+    roleId: string,
+    status: WorkspaceMember['status'],
+    summary?: string,
+    sessionId?: string,
+  ): void {
+    const member = this.state.members[roleId];
+    if (!member) {
+      return;
+    }
+    const nextMember: WorkspaceMember = {
+      ...member,
+      status,
+      ...(summary ? { publicStateSummary: summary } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      lastActivityAt: new Date().toISOString(),
+    };
+    this.state.members[roleId] = nextMember;
+    const event: MemberStateChangedEvent = {
+      type: 'member.state.changed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      member: { ...nextMember },
+    };
+    this.emitEvent(event);
+  }
+
+  private publishActivity(
+    kind: WorkspaceActivityKind,
+    text: string,
+    details: {
+      roleId?: string;
+      dispatchId?: string;
+      taskId?: string;
+      visibility?: WorkspaceVisibility;
+    } = {},
+  ): void {
+    const activity: WorkspaceActivity = {
+      activityId: randomUUID(),
+      workspaceId: this.spec.id,
+      kind,
+      visibility: details.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      text,
+      createdAt: new Date().toISOString(),
+      ...(details.roleId ? { roleId: details.roleId, memberId: details.roleId } : {}),
+      ...(details.dispatchId ? { dispatchId: details.dispatchId } : {}),
+      ...(details.taskId ? { taskId: details.taskId } : {}),
+    };
+    this.state.activities = [...this.state.activities, activity];
+    const event: ActivityPublishedEvent = {
+      type: 'activity.published',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      activity,
+    };
+    this.emitEvent(event);
   }
 }

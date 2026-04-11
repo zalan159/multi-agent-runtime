@@ -6,8 +6,21 @@ export function createOpcSoloCompanyTemplate(): WorkspaceTemplate {
     templateName: 'OPC Solo Company',
     description: 'A one-person company staffed by specialist digital operators.',
     defaultRoleId: 'ceo',
+    coordinatorRoleId: 'ceo',
     orchestratorPrompt:
       'You orchestrate a one-person company staffed by specialist digital operators. Route work to the best role, keep recommendations practical, and prefer concrete operating documents over abstract advice.',
+    claimPolicy: {
+      mode: 'coordinator_only',
+      maxAssignees: 1,
+      fallbackRoleId: 'ceo',
+    },
+    activityPolicy: {
+      publishUserMessages: true,
+      publishCoordinatorMessages: true,
+      publishDispatchLifecycle: true,
+      publishMemberMessages: true,
+      defaultVisibility: 'public',
+    },
     roles: [
       {
         id: 'ceo',

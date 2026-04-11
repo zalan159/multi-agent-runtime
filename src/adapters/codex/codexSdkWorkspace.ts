@@ -12,6 +12,8 @@ import {
 } from '@openai/codex-sdk';
 
 import type {
+  ActivityPublishedEvent,
+  DispatchClaimedEvent,
   DispatchCompletedEvent,
   DispatchProgressEvent,
   DispatchResultEvent,
@@ -19,15 +21,29 @@ import type {
   WorkspaceInitializedEvent,
   WorkspaceMessageEvent,
   WorkspaceStateChangedEvent,
+  MemberRegisteredEvent,
+  MemberStateChangedEvent,
 } from '../../core/events.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
+  ClaimStatus,
   RoleSpec,
   RoleTaskRequest,
   TaskDispatch,
+  WorkspaceActivity,
+  WorkspaceActivityKind,
+  WorkspaceMember,
   WorkspaceSpec,
   WorkspaceState,
+  WorkspaceTurnRequest,
+  WorkspaceTurnResult,
+  WorkspaceVisibility,
 } from '../../core/types.js';
+import {
+  buildWorkspaceTurnPrompt,
+  planWorkspaceTurnHeuristically,
+  parseWorkspaceTurnPlan,
+} from '../../core/workspaceTurn.js';
 
 export interface CodexSdkWorkspaceOptions {
   spec: WorkspaceSpec;
@@ -104,6 +120,20 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       provider: 'codex-sdk',
       roles: Object.fromEntries(this.spec.roles.map(role => [role.id, role])),
       dispatches: {},
+      members: Object.fromEntries(
+        this.spec.roles.map(role => [
+          role.id,
+          {
+            memberId: role.id,
+            workspaceId: this.spec.id,
+            roleId: role.id,
+            roleName: role.name,
+            ...(role.direct !== undefined ? { direct: role.direct } : {}),
+            status: 'idle',
+          } satisfies WorkspaceMember,
+        ]),
+      ),
+      activities: [],
     };
   }
 
@@ -112,6 +142,8 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       ...this.state,
       roles: { ...this.state.roles },
       dispatches: { ...this.state.dispatches },
+      members: { ...this.state.members },
+      activities: [...this.state.activities],
     };
   }
 
@@ -130,6 +162,15 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       workspaceId: this.spec.id,
       spec: this.spec,
     });
+    for (const member of Object.values(this.state.members)) {
+      const event: MemberRegisteredEvent = {
+        type: 'member.registered',
+        timestamp: new Date().toISOString(),
+        workspaceId: this.spec.id,
+        member: { ...member },
+      };
+      this.emitEvent(event);
+    }
 
     this.emitInitialized({});
     this.emitStateChanged('running');
@@ -151,6 +192,16 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       status: 'queued',
       createdAt: new Date().toISOString(),
       ...(request.summary ? { summary: request.summary } : {}),
+      ...(request.visibility ? { visibility: request.visibility } : {}),
+      ...(request.sourceRoleId ? { sourceRoleId: request.sourceRoleId } : {}),
+      ...(this.spec.claimPolicy?.mode !== 'claim'
+        ? {
+            claimStatus: 'claimed' satisfies ClaimStatus,
+            claimedByMemberIds: [role.id],
+          }
+        : {
+            claimStatus: 'pending' satisfies ClaimStatus,
+          }),
     };
 
     this.state.dispatches[dispatch.dispatchId] = dispatch;
@@ -161,6 +212,18 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       workspaceId: this.spec.id,
       dispatch: { ...dispatch },
     });
+    if (dispatch.claimStatus === 'claimed') {
+      const event: DispatchClaimedEvent = {
+        type: 'dispatch.claimed',
+        timestamp: new Date().toISOString(),
+        workspaceId: this.spec.id,
+        dispatch: { ...dispatch },
+        member: this.state.members[role.id]!,
+        claimStatus: 'claimed',
+        note: 'Assigned by policy',
+      };
+      this.emitEvent(event);
+    }
 
     const previous = this.roleChains.get(role.id) ?? Promise.resolve();
     const current = previous
@@ -176,11 +239,83 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     return { ...dispatch };
   }
 
+  async send(message: string, visibility: WorkspaceVisibility = 'public'): Promise<void> {
+    this.ensureStarted();
+
+    const event: WorkspaceMessageEvent = {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      role: 'user',
+      text: message,
+      visibility,
+      raw: {
+        type: 'workspace_user_message',
+      },
+      ...(this.state.sessionId ? { sessionId: this.state.sessionId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('user_message', message, { visibility });
+  }
+
   async runRoleTask(
     request: RoleTaskRequest,
     options: { timeoutMs?: number; resultTimeoutMs?: number } = {},
   ): Promise<TaskDispatch> {
     return this.runDispatch(this.assignRoleTask(request), options);
+  }
+
+  async runWorkspaceTurn(
+    request: WorkspaceTurnRequest,
+    options: { timeoutMs?: number; resultTimeoutMs?: number } = {},
+  ): Promise<WorkspaceTurnResult> {
+    const coordinatorRole = this.resolveCoordinatorRole();
+    await this.send(request.message, request.visibility ?? 'public');
+
+    const coordinatorDispatch = this.spec.claimPolicy?.mode === 'claim'
+      ? undefined
+      : await this.runRoleTask(
+          {
+            roleId: coordinatorRole.id,
+            summary: `Coordinate workspace turn for: ${request.message}`,
+            instruction: buildWorkspaceTurnPrompt(this.spec, request),
+            visibility: 'coordinator',
+            sourceRoleId: coordinatorRole.id,
+          },
+          options,
+        );
+
+    const plan = coordinatorDispatch
+      ? parseWorkspaceTurnPlan(
+          coordinatorDispatch.resultText ?? coordinatorDispatch.lastSummary ?? '',
+          this.spec,
+          request,
+        )
+      : planWorkspaceTurnHeuristically(this.spec, request);
+
+    this.emitCoordinatorSummary(plan.responseText, coordinatorRole.id);
+
+    const dispatches: TaskDispatch[] = [];
+    for (const assignment of plan.assignments) {
+      const dispatch = await this.assignRoleTask({
+        roleId: assignment.roleId,
+        instruction: assignment.instruction,
+        ...(assignment.summary ? { summary: assignment.summary } : {}),
+        visibility: assignment.visibility ?? request.visibility ?? 'public',
+        sourceRoleId: coordinatorRole.id,
+      });
+      this.claimDispatch(dispatch.dispatchId, assignment.roleId, 'Claimed by coordinator routing');
+      dispatches.push(
+        await this.runDispatch(Promise.resolve(dispatch), options),
+      );
+    }
+
+    return {
+      request,
+      ...(coordinatorDispatch ? { coordinatorDispatch } : {}),
+      plan,
+      dispatches,
+    };
   }
 
   async stopTask(taskId: string): Promise<void> {
@@ -247,6 +382,18 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
             dispatch: this.cloneDispatch(nextDispatch),
             taskId: event.thread_id,
             description: dispatch.summary ?? dispatch.instruction,
+          });
+          this.updateMemberState(
+            role.id,
+            'active',
+            dispatch.summary ?? dispatch.instruction,
+            event.thread_id,
+          );
+          this.publishActivity('dispatch_started', dispatch.summary ?? dispatch.instruction, {
+            roleId: role.id,
+            dispatchId: dispatch.dispatchId,
+            taskId: event.thread_id,
+            visibility: nextDispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
           });
           continue;
         }
@@ -361,6 +508,19 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     return thread;
   }
 
+  private resolveCoordinatorRole(): RoleSpec {
+    const coordinatorRoleId =
+      this.spec.coordinatorRoleId ?? this.spec.defaultRoleId ?? this.spec.roles[0]?.id;
+    if (!coordinatorRoleId) {
+      throw new Error('Workspace has no coordinator role.');
+    }
+    const coordinatorRole = this.state.roles[coordinatorRoleId];
+    if (!coordinatorRole) {
+      throw new Error(`Unknown coordinator role: ${coordinatorRoleId}`);
+    }
+    return coordinatorRole;
+  }
+
   private handleItemStarted(
     dispatchId: string,
     item: ThreadItem,
@@ -456,11 +616,25 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
         workspaceId: this.spec.id,
         role: 'assistant',
         text: item.text,
+        visibility: dispatch.visibility ?? 'public',
+        memberId: dispatch.roleId,
         raw: item,
         ...(dispatch.providerTaskId ? { sessionId: dispatch.providerTaskId } : {}),
         ...(dispatch.toolUseId ? { parentToolUseId: dispatch.toolUseId } : {}),
       };
       this.emitEvent(messageEvent);
+      this.updateMemberState(
+        dispatch.roleId,
+        'active',
+        item.text,
+        dispatch.providerTaskId,
+      );
+      this.publishActivity('member_summary', item.text, {
+        roleId: dispatch.roleId,
+        dispatchId,
+        taskId: dispatch.providerTaskId ?? dispatch.dispatchId,
+        visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      });
       return { resultText: item.text };
     }
 
@@ -532,6 +706,18 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       ...(progress.lastToolName ? { lastToolName: progress.lastToolName } : {}),
     };
     this.emitEvent(event);
+    this.updateMemberState(
+      dispatch.roleId,
+      'active',
+      progress.summary ?? progress.description,
+      dispatch.providerTaskId,
+    );
+    this.publishActivity('member_progress', progress.summary ?? progress.description, {
+      roleId: dispatch.roleId,
+      dispatchId,
+      taskId: dispatch.providerTaskId ?? dispatch.dispatchId,
+      visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+    });
   }
 
   private finishDispatch(
@@ -570,6 +756,26 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       summary: result.summary,
     };
     this.emitEvent(event);
+    this.updateMemberState(
+      dispatch.roleId,
+      result.status === 'completed'
+        ? 'idle'
+        : result.status === 'failed'
+          ? 'blocked'
+          : 'waiting',
+      result.summary,
+      taskId,
+    );
+    this.publishActivity(
+      result.status === 'completed' ? 'member_delivered' : 'member_summary',
+      result.summary,
+      {
+        roleId: dispatch.roleId,
+        dispatchId,
+        taskId,
+        visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      },
+    );
 
     if (result.resultText) {
       const resultEvent: DispatchResultEvent = {
@@ -617,6 +823,28 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     this.emitEvent(event);
   }
 
+  private emitCoordinatorSummary(text: string, roleId: string): void {
+    const event: WorkspaceMessageEvent = {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      role: 'assistant',
+      text,
+      visibility: 'public',
+      memberId: roleId,
+      raw: {
+        type: 'workspace_turn_summary',
+        roleId,
+      },
+      ...(this.state.sessionId ? { sessionId: this.state.sessionId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('coordinator_message', text, {
+      roleId,
+      visibility: 'public',
+    });
+  }
+
   private emitStateChanged(state: WorkspaceStateChangedEvent['state']): void {
     const event: WorkspaceStateChangedEvent = {
       type: 'workspace.state.changed',
@@ -625,6 +853,98 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       state,
     };
     this.emitEvent(event);
+  }
+
+  private updateMemberState(
+    roleId: string,
+    status: WorkspaceMember['status'],
+    summary?: string,
+    sessionId?: string,
+  ): void {
+    const member = this.state.members[roleId];
+    if (!member) {
+      return;
+    }
+    const nextMember: WorkspaceMember = {
+      ...member,
+      status,
+      ...(summary ? { publicStateSummary: summary } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      lastActivityAt: new Date().toISOString(),
+    };
+    this.state.members[roleId] = nextMember;
+    const event: MemberStateChangedEvent = {
+      type: 'member.state.changed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      member: { ...nextMember },
+    };
+    this.emitEvent(event);
+  }
+
+  private publishActivity(
+    kind: WorkspaceActivityKind,
+    text: string,
+    details: {
+      roleId?: string;
+      dispatchId?: string;
+      taskId?: string;
+      visibility?: WorkspaceVisibility;
+    } = {},
+  ): void {
+    const activity: WorkspaceActivity = {
+      activityId: randomUUID(),
+      workspaceId: this.spec.id,
+      kind,
+      visibility: details.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      text,
+      createdAt: new Date().toISOString(),
+      ...(details.roleId ? { roleId: details.roleId, memberId: details.roleId } : {}),
+      ...(details.dispatchId ? { dispatchId: details.dispatchId } : {}),
+      ...(details.taskId ? { taskId: details.taskId } : {}),
+    };
+    this.state.activities = [...this.state.activities, activity];
+    const event: ActivityPublishedEvent = {
+      type: 'activity.published',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      activity,
+    };
+    this.emitEvent(event);
+  }
+
+  private claimDispatch(
+    dispatchId: string,
+    roleId: string,
+    note?: string,
+    claimStatus: ClaimStatus = 'claimed',
+  ): void {
+    const dispatch = this.state.dispatches[dispatchId];
+    const member = this.state.members[roleId];
+    if (!dispatch || !member) {
+      return;
+    }
+
+    dispatch.claimStatus = claimStatus;
+    dispatch.claimedByMemberIds = Array.from(
+      new Set([...(dispatch.claimedByMemberIds ?? []), roleId]),
+    );
+
+    const event: DispatchClaimedEvent = {
+      type: 'dispatch.claimed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      dispatch: { ...dispatch },
+      member: { ...member },
+      claimStatus,
+      ...(note ? { note } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('member_claimed', note ?? `${member.roleName} claimed the task.`, {
+      roleId,
+      dispatchId,
+      visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+    });
   }
 
   private ensureStarted(): void {

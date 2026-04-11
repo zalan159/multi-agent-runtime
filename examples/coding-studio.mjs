@@ -24,15 +24,13 @@ const stopLogging = attachConsoleLogger(workspace, 'coding');
 
 try {
   await workspace.start();
-  const dispatch = await workspace.runRoleTask({
-    roleId: 'prd',
-    summary: 'Create a PRD stub for group mentions',
-    instruction:
-      'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
+  const turn = await workspace.runWorkspaceTurn({
+    message:
+      'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
   }, { timeoutMs: 180000, resultTimeoutMs: 20000 });
 
-  console.log('\nFINAL DISPATCH');
-  console.log(JSON.stringify(dispatch, null, 2));
+  console.log('\nWORKSPACE TURN');
+  console.log(JSON.stringify(turn, null, 2));
   await printFileIfExists(path.join(cwd, '10-prd/group-mentions.md'));
 } finally {
   stopLogging();

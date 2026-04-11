@@ -1,4 +1,11 @@
-import type { TaskDispatch, WorkspaceSpec } from './types.js';
+import type {
+  ClaimStatus,
+  TaskDispatch,
+  WorkspaceActivity,
+  WorkspaceMember,
+  WorkspaceSpec,
+  WorkspaceVisibility,
+} from './types.js';
 
 export interface BaseWorkspaceEvent {
   timestamp: string;
@@ -27,9 +34,34 @@ export interface WorkspaceMessageEvent extends BaseWorkspaceEvent {
   type: 'message';
   role: 'user' | 'assistant' | 'system';
   text: string;
+  visibility?: WorkspaceVisibility;
+  memberId?: string;
   sessionId?: string;
   parentToolUseId?: string | null;
   raw: unknown;
+}
+
+export interface MemberRegisteredEvent extends BaseWorkspaceEvent {
+  type: 'member.registered';
+  member: WorkspaceMember;
+}
+
+export interface MemberStateChangedEvent extends BaseWorkspaceEvent {
+  type: 'member.state.changed';
+  member: WorkspaceMember;
+}
+
+export interface DispatchClaimedEvent extends BaseWorkspaceEvent {
+  type: 'dispatch.claimed';
+  dispatch: TaskDispatch;
+  member: WorkspaceMember;
+  claimStatus: ClaimStatus;
+  note?: string;
+}
+
+export interface ActivityPublishedEvent extends BaseWorkspaceEvent {
+  type: 'activity.published';
+  activity: WorkspaceActivity;
 }
 
 export interface DispatchQueuedEvent extends BaseWorkspaceEvent {
@@ -94,6 +126,10 @@ export type WorkspaceEvent =
   | WorkspaceInitializedEvent
   | WorkspaceStateChangedEvent
   | WorkspaceMessageEvent
+  | MemberRegisteredEvent
+  | MemberStateChangedEvent
+  | DispatchClaimedEvent
+  | ActivityPublishedEvent
   | DispatchQueuedEvent
   | DispatchStartedEvent
   | DispatchProgressEvent

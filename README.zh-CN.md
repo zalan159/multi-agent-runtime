@@ -5,8 +5,9 @@
 一个面向多 Agent 协作场景的轻量运行时，目前已经对接官方 Claude Agent SDK 和 Codex SDK。
 
 这套包的目标不是再造一个通用图编排框架，而是提供一层统一协议，用来完成这些事：
-- 定义角色型 Agent
-- 把任务明确委派给某个角色
+- 定义角色型 Agent 和 coordinator
+- 接收一条工作间级别的用户输入，并在团队内部完成路由
+- 建模工作间成员、公开动态和 claim 规则
 - 以统一事件流观察任务生命周期
 - 用真实 Claude 调用做端到端验收
 
@@ -23,10 +24,11 @@
 ## 它解决什么问题
 
 `@cteno/multi-agent-runtime` 把一个多 Agent 工作间建模成：
-- 一个持久的 orchestrator session
-- 多个具名角色 Agent，作为 Claude subagents 注册
+- 一个 coordinator 角色
+- 多个具名工作间成员
 - 显式的角色派发，比如 `prd`、`finance`、`scout`
-- 一条统一的事件流，覆盖 `workspace`、`dispatch`、`message`、`tool.progress`、`result`
+- 可选的 claim 式认领规则
+- 一条统一的事件流，覆盖 `workspace`、`member`、`activity`、`dispatch`、`message`、`tool.progress`、`result`
 
 这和 Claude 当前公开接口的形态比较契合：Claude 更像 `session + subagent + task lifecycle`，而不是一套直接暴露给用户的图编排运行时。
 
@@ -80,6 +82,19 @@
 - 实验设计草案
 - 研究质疑与补充
 
+### `Three Departments Six Ministries`
+一个偏制度化治理的多 Agent 工作间模板，适合复杂任务的拟令、审议、执行、资源约束、合规和发布协同。
+
+角色包括：
+- `shangshu`
+- `zhongshu`
+- `menxia`
+- `gongbu`
+- `hubu`
+- `libu`
+- `xingbu`
+- `bingbu`
+
 ## 安装
 
 ```bash
@@ -121,15 +136,14 @@ workspace.onEvent(event => {
 
 await workspace.start();
 
-const dispatch = await workspace.runRoleTask({
-  roleId: 'prd',
-  summary: '起草群聊 @mention 的 PRD',
-  instruction:
-    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
+const turn = await workspace.runWorkspaceTurn({
+  message:
+    '我们需要一个群聊 @mentions 功能的短 PRD，请在 10-prd/group-mentions.md 里创建，并包含 Goal、User Story、Scope、Non-Goals、Acceptance Criteria。',
 });
 
-console.log(dispatch.status);
-console.log(dispatch.resultText);
+console.log(turn.plan);
+console.log(turn.dispatches[0]?.status);
+console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
@@ -161,19 +175,27 @@ const workspace = new CodexSdkWorkspace({
 });
 
 await workspace.start();
-const dispatch = await workspace.runRoleTask({
-  roleId: 'prd',
-  summary: '起草群聊 @mention 的 PRD',
-  instruction:
-    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature.',
+const turn = await workspace.runWorkspaceTurn({
+  message:
+    '我们需要一个群聊 @mentions 功能的短 PRD，请在 10-prd/group-mentions.md 里创建，并包含 Goal、User Story、Scope、Non-Goals、Acceptance Criteria。',
 });
 
-console.log(dispatch.status);
-console.log(dispatch.resultText);
+console.log(turn.plan);
+console.log(turn.dispatches[0]?.status);
+console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
 ## 运行时 API
+
+### `runWorkspaceTurn()`
+接收一条工作间级别的用户输入，让 coordinator 解释意图、公开工作间动态，并返回被路由后的角色 dispatch。
+
+这是现在体现完整 multi-agent 效果的主入口：
+- 一条用户消息进入工作间
+- coordinator 决定谁来 claim
+- 被选中的成员通过具体 provider adapter 执行
+- 工作间会公开发出用户消息、coordinator 回复、claim、进度、交付等 activity
 
 ### `assignRoleTask()`
 把任务排队发给某个角色，立即返回本地 dispatch 记录。
@@ -183,7 +205,7 @@ await workspace.close();
 - dispatch 进入终态
 - Claude 返回该任务的最终文本结果（如果有）
 
-这是最适合做 live e2e 的接口。
+这个接口仍然适合做确定性、低层的 adapter 验证。
 
 ### `onEvent()`
 订阅工作间事件流。
@@ -192,6 +214,10 @@ await workspace.close();
 - `workspace.started`
 - `workspace.initialized`
 - `workspace.state.changed`
+- `member.registered`
+- `member.state.changed`
+- `activity.published`
+- `dispatch.claimed`
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`
@@ -226,7 +252,17 @@ cargo test
 当前 Rust crates：
 - `multi-agent-protocol`
 - `multi-agent-runtime-core`
+- `multi-agent-runtime-claude`
+- `multi-agent-runtime-codex`
 - `multi-agent-runtime-cteno`
+
+如果要显式跑 Rust 的 provider live 校验：
+
+```bash
+cd rust
+cargo test -p multi-agent-runtime-claude --test live_claude_e2e -- --ignored --nocapture
+cargo test -p multi-agent-runtime-codex --test live_codex_e2e -- --ignored --nocapture
+```
 
 ## Smoke 命令
 

@@ -6,8 +6,23 @@ export function createCodingStudioTemplate(): WorkspaceTemplate {
     templateName: 'Coding Studio',
     description: 'A software delivery workspace with fixed specialist roles.',
     defaultRoleId: 'pm',
+    coordinatorRoleId: 'pm',
     orchestratorPrompt:
       'You are the orchestrator for a software delivery workspace. Keep the team aligned, route work to the correct role agent, and summarize progress crisply.',
+    claimPolicy: {
+      mode: 'claim',
+      claimTimeoutMs: 1500,
+      maxAssignees: 1,
+      allowSupportingClaims: true,
+      fallbackRoleId: 'pm',
+    },
+    activityPolicy: {
+      publishUserMessages: true,
+      publishCoordinatorMessages: true,
+      publishDispatchLifecycle: true,
+      publishMemberMessages: true,
+      defaultVisibility: 'public',
+    },
     roles: [
       {
         id: 'pm',
@@ -27,8 +42,10 @@ export function createCodingStudioTemplate(): WorkspaceTemplate {
         agent: {
           description: 'Writes product requirement docs and task definitions.',
           prompt:
-            'You write implementation-ready PRDs. Be concrete about user stories, scope, edge cases, and acceptance criteria.',
+            'You write implementation-ready PRDs. Always produce a concrete markdown deliverable instead of notes. Include explicit sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria, and make the content specific enough for downstream implementation.',
           capabilities: ['read', 'write', 'edit', 'glob', 'grep'],
+          initialPrompt:
+            'Default PRD contract: write the deliverable under `10-prd/` unless the task gives another file path. Use these exact markdown section headings: `## Goal`, `## User Story`, `## Scope`, `## Non-Goals`, `## Acceptance Criteria`. Do not stop at an overview.',
         },
       },
       {

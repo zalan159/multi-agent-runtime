@@ -8,9 +8,9 @@ import {
   createCodingStudioTemplate,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceScenario } from './_shared.mjs';
+import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
 
-test('coding studio e2e generates a usable PRD through the prd role', { timeout: 240_000 }, async () => {
+test('coding studio e2e routes a workspace turn to the prd role and generates a usable PRD', { timeout: 240_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-coding');
   const outputFile = path.join(cwd, '10-prd/group-mentions.md');
   const workspace = new ClaudeAgentWorkspace({
@@ -25,20 +25,17 @@ test('coding studio e2e generates a usable PRD through the prd role', { timeout:
     ),
   });
 
-  const { dispatch, fileText } = await runWorkspaceScenario({
+  const { dispatch, turn, fileText } = await runWorkspaceTurnScenario({
     workspace,
-    task: {
-      roleId: 'prd',
-      summary: 'Create a PRD stub for group mentions',
-      instruction:
-        'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
-    },
+    message:
+      'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
     expectedRoleId: 'prd',
     outputFile,
   });
 
+  assert.match(turn.plan.responseText, /@prd|PRD/i);
   assert.match(dispatch.resultText, /PRD|group mentions|acceptance/i);
-  assert.match(fileText, /^# /m);
+  assert.match(fileText, /^(# |## Goal)/m);
   assert.match(fileText, /## Goal/i);
   assert.match(fileText, /## User Story/i);
   assert.match(fileText, /## Scope/i);

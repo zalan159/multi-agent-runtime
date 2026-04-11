@@ -5,8 +5,9 @@
 A small, extraction-friendly runtime for running role-based multi-agent workspaces on top of the official Claude Agent SDK and Codex SDK.
 
 This package gives us one unified protocol for:
-- defining role agents
-- delegating work to a specific role
+- defining role agents and coordinator roles
+- accepting a workspace-level user turn and routing it across the team
+- modeling workspace members, public activity, and claim policies
 - observing task lifecycle as events
 - validating generated artifacts in end-to-end tests
 
@@ -23,10 +24,11 @@ The protocol is intentionally generic enough to support a future Cteno-native ad
 ## What It Does
 
 `@cteno/multi-agent-runtime` treats a workspace as:
-- one persistent orchestrator session
-- multiple named role agents declared as Claude subagents
+- one coordinator role
+- multiple named workspace members
 - explicit role dispatches such as `prd`, `finance`, or `scout`
-- a unified event stream for `workspace`, `dispatch`, `message`, `tool.progress`, and `result`
+- optional claim-based assignment rules
+- a unified event stream for `workspace`, `member`, `activity`, `dispatch`, `message`, `tool.progress`, and `result`
 
 That maps well onto Claude's session-centric model while keeping our authoring model role-centric.
 
@@ -80,6 +82,19 @@ Typical outcome:
 - experiment outlines
 - research critiques
 
+### `Three Departments Six Ministries`
+A governance-style multi-agent template for planning, review, execution, oversight, and release coordination.
+
+Roles include:
+- `shangshu`
+- `zhongshu`
+- `menxia`
+- `gongbu`
+- `hubu`
+- `libu`
+- `xingbu`
+- `bingbu`
+
 ## Install
 
 ```bash
@@ -121,15 +136,14 @@ workspace.onEvent(event => {
 
 await workspace.start();
 
-const dispatch = await workspace.runRoleTask({
-  roleId: 'prd',
-  summary: 'Draft a PRD for group mentions',
-  instruction:
-    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature. Include sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
+const turn = await workspace.runWorkspaceTurn({
+  message:
+    'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
 });
 
-console.log(dispatch.status);
-console.log(dispatch.resultText);
+console.log(turn.plan);
+console.log(turn.dispatches[0]?.status);
+console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
@@ -161,19 +175,27 @@ const workspace = new CodexSdkWorkspace({
 });
 
 await workspace.start();
-const dispatch = await workspace.runRoleTask({
-  roleId: 'prd',
-  summary: 'Draft a PRD for group mentions',
-  instruction:
-    'Create a short markdown PRD at 10-prd/group-mentions.md for a group-chat mention feature.',
+const turn = await workspace.runWorkspaceTurn({
+  message:
+    'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria.',
 });
 
-console.log(dispatch.status);
-console.log(dispatch.resultText);
+console.log(turn.plan);
+console.log(turn.dispatches[0]?.status);
+console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
 ## Runtime API
+
+### `runWorkspaceTurn()`
+Takes a single workspace-level user message, lets the coordinator interpret it, emits public workspace activity, and returns the routed role dispatches.
+
+This is now the primary API for the full multi-agent effect:
+- one user message enters the workspace
+- the coordinator decides who should claim it
+- the selected member(s) run through the provider adapter
+- public activity is emitted for user messages, coordinator responses, claims, progress, and delivery
 
 ### `assignRoleTask()`
 Queues a task for a role and returns immediately with the local dispatch record.
@@ -183,7 +205,7 @@ Queues a task and waits until:
 - the dispatch reaches a terminal state
 - Claude returns final result text for the delegated task, when available
 
-This is the most convenient API for live e2e checks.
+This remains useful for deterministic low-level tests and adapter debugging.
 
 ### `onEvent()`
 Subscribes to the workspace event stream.
@@ -192,6 +214,10 @@ Useful event types:
 - `workspace.started`
 - `workspace.initialized`
 - `workspace.state.changed`
+- `member.registered`
+- `member.state.changed`
+- `activity.published`
+- `dispatch.claimed`
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`
@@ -226,7 +252,17 @@ cargo test
 Rust crates:
 - `multi-agent-protocol`
 - `multi-agent-runtime-core`
+- `multi-agent-runtime-claude`
+- `multi-agent-runtime-codex`
 - `multi-agent-runtime-cteno`
+
+Run Rust live provider checks explicitly:
+
+```bash
+cd rust
+cargo test -p multi-agent-runtime-claude --test live_claude_e2e -- --ignored --nocapture
+cargo test -p multi-agent-runtime-codex --test live_codex_e2e -- --ignored --nocapture
+```
 
 ## Smoke Commands
 

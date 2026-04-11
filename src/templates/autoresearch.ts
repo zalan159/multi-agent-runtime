@@ -6,8 +6,23 @@ export function createAutoresearchTemplate(): WorkspaceTemplate {
     templateName: 'Autoresearch',
     description: 'A research-oriented workspace for scouting and synthesis.',
     defaultRoleId: 'lead',
+    coordinatorRoleId: 'lead',
     orchestratorPrompt:
       'You orchestrate an autonomous research workspace. Keep hypotheses explicit, separate evidence from interpretation, and favor compact research artifacts that can feed later evaluation loops.',
+    claimPolicy: {
+      mode: 'claim',
+      claimTimeoutMs: 1000,
+      maxAssignees: 2,
+      allowSupportingClaims: true,
+      fallbackRoleId: 'lead',
+    },
+    activityPolicy: {
+      publishUserMessages: true,
+      publishCoordinatorMessages: true,
+      publishDispatchLifecycle: true,
+      publishMemberMessages: true,
+      defaultVisibility: 'public',
+    },
     roles: [
       {
         id: 'lead',

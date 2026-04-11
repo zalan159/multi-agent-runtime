@@ -68,6 +68,83 @@ export async function runWorkspaceScenario({
   }
 }
 
+export async function runWorkspaceTurnScenario({
+  workspace,
+  message,
+  expectedRoleId,
+  outputFile,
+  timeoutMs = 180_000,
+  resultTimeoutMs = 20_000,
+}) {
+  const events = [];
+  const stopListening = workspace.onEvent(event => {
+    events.push(event);
+  });
+
+  try {
+    await workspace.start();
+    const turn = await workspace.runWorkspaceTurn(
+      { message },
+      { timeoutMs, resultTimeoutMs },
+    );
+    const dispatch = turn.dispatches[0];
+    assert.ok(dispatch, 'Expected at least one role dispatch from workspace turn');
+
+    const fileText = await readRequiredFile(outputFile);
+    const initializedEvents = events.filter(event => event.type === 'workspace.initialized');
+    assert.ok(initializedEvents.length >= 1, 'Expected at least one workspace.initialized event');
+
+    const userMessageEvent = events.find(
+      event => event.type === 'activity.published' && event.activity.kind === 'user_message',
+    );
+    const coordinatorActivity = events.find(
+      event =>
+        event.type === 'activity.published' && event.activity.kind === 'coordinator_message',
+    );
+    const claimedEvent = events.find(
+      event =>
+        event.type === 'dispatch.claimed' &&
+        event.dispatch.dispatchId === dispatch.dispatchId &&
+        event.member.roleId === expectedRoleId,
+    );
+    const completedEvent = events.find(
+      event =>
+        event.type === 'dispatch.completed' && event.dispatch.dispatchId === dispatch.dispatchId,
+    );
+    const resultEvent = events.find(
+      event => event.type === 'dispatch.result' && event.dispatch.dispatchId === dispatch.dispatchId,
+    );
+
+    assert.ok(userMessageEvent, 'Expected a public user_message activity');
+    assert.ok(coordinatorActivity, 'Expected a public coordinator_message activity');
+    assert.ok(
+      claimedEvent || dispatch.claimStatus === 'claimed',
+      'Expected the selected member to claim the dispatch',
+    );
+    assert.ok(completedEvent, 'Expected the selected dispatch to complete');
+    assert.ok(resultEvent, 'Expected the selected dispatch to return final result text');
+    assert.equal(dispatch.roleId, expectedRoleId);
+    assert.equal(dispatch.claimStatus, 'claimed');
+    assert.ok(dispatch.resultText && dispatch.resultText.trim().length > 0, 'Expected non-empty resultText');
+    assert.ok(fileText.trim().length > 0, 'Expected generated file to be non-empty');
+
+    return {
+      turn,
+      dispatch,
+      events,
+      fileText,
+      outputFile,
+    };
+  } finally {
+    stopListening();
+    await workspace.close();
+  }
+}
+
 export function countMarkdownLinks(text) {
   return (text.match(/\[[^\]]+\]\(https?:\/\/[^)]+\)/g) ?? []).length;
+}
+
+export function countHttpUrls(text) {
+  return (text.match(/https?:\/\/[^\s)\]]+/g) ?? []).length;
 }

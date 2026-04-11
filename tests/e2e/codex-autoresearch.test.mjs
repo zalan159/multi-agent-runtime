@@ -3,26 +3,38 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
-  ClaudeAgentWorkspace,
+  CodexSdkWorkspace,
   createAutoresearchTemplate,
-  createClaudeWorkspaceProfile,
+  createCodexWorkspaceProfile,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { countMarkdownLinks, createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  countHttpUrls,
+  countMarkdownLinks,
+  createScratchDir,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
-test('autoresearch e2e routes a workspace turn to scout and writes a sourced brief', { timeout: 540_000 }, async () => {
-  const cwd = await createScratchDir('cteno-e2e-autoresearch');
+test('codex sdk e2e routes an autoresearch workspace turn to scout and writes a sourced brief', { timeout: 420_000 }, async () => {
+  const cwd = await createScratchDir('cteno-e2e-codex-autoresearch');
   const outputFile = path.join(cwd, 'research/10-scout/mention-patterns.md');
-  const workspace = new ClaudeAgentWorkspace({
+  const workspace = new CodexSdkWorkspace({
     spec: instantiateWorkspace(
       createAutoresearchTemplate(),
       {
-        id: `autoresearch-e2e-${Date.now()}`,
-        name: 'Autoresearch E2E',
+        id: `codex-autoresearch-e2e-${Date.now()}`,
+        name: 'Codex Autoresearch E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createCodexWorkspaceProfile({
+        model: 'gpt-5.1-codex-mini',
+      }),
     ),
+    skipGitRepoCheck: true,
+    approvalPolicy: 'never',
+    sandboxMode: 'workspace-write',
+    networkAccessEnabled: true,
+    webSearchMode: 'live',
   });
 
   const { dispatch, turn, events, fileText } = await runWorkspaceTurnScenario({
@@ -31,7 +43,7 @@ test('autoresearch e2e routes a workspace turn to scout and writes a sourced bri
       'Research how collaboration tools like Slack and GitHub handle @mentions and directed attention, then write a concise brief to research/10-scout/mention-patterns.md with three short source links and a final section called Implications for Cteno.',
     expectedRoleId: 'scout',
     outputFile,
-    timeoutMs: 480_000,
+    timeoutMs: 360_000,
     resultTimeoutMs: 30_000,
   });
 
@@ -42,5 +54,8 @@ test('autoresearch e2e routes a workspace turn to scout and writes a sourced bri
   assert.match(fileText, /Implications for Cteno/i);
   assert.match(fileText, /Slack/i);
   assert.match(fileText, /GitHub/i);
-  assert.ok(countMarkdownLinks(fileText) >= 3, 'Expected at least three source links in the research brief');
+  assert.ok(
+    Math.max(countMarkdownLinks(fileText), countHttpUrls(fileText)) >= 3,
+    'Expected at least three source links in the research brief',
+  );
 });

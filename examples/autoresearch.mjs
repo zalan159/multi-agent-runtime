@@ -24,15 +24,13 @@ const stopLogging = attachConsoleLogger(workspace, 'autoresearch');
 
 try {
   await workspace.start();
-  const dispatch = await workspace.runRoleTask({
-    roleId: 'scout',
-    summary: 'Research the product pattern behind @mentions',
-    instruction:
-      'Use web research if helpful, then create a concise markdown brief at research/10-scout/mention-patterns.md comparing how Slack, GitHub, or similar collaboration tools handle @mentions and directed attention. Include 3 short source links and a final section called Implications for Cteno.',
+  const turn = await workspace.runWorkspaceTurn({
+    message:
+      'Research how collaboration tools like Slack and GitHub handle @mentions and directed attention, then write a concise brief to research/10-scout/mention-patterns.md with three short source links and a final section called Implications for Cteno.',
   }, { timeoutMs: 240000, resultTimeoutMs: 30000 });
 
-  console.log('\nFINAL DISPATCH');
-  console.log(JSON.stringify(dispatch, null, 2));
+  console.log('\nWORKSPACE TURN');
+  console.log(JSON.stringify(turn, null, 2));
   await printFileIfExists(path.join(cwd, 'research/10-scout/mention-patterns.md'));
 } finally {
   stopLogging();

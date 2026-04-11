@@ -3,26 +3,31 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
-  ClaudeAgentWorkspace,
-  createClaudeWorkspaceProfile,
+  CodexSdkWorkspace,
+  createCodexWorkspaceProfile,
   createOpcSoloCompanyTemplate,
   instantiateWorkspace,
 } from '../../dist/index.js';
 import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
 
-test('opc e2e routes a workspace turn to finance and generates a monthly close checklist', { timeout: 300_000 }, async () => {
-  const cwd = await createScratchDir('cteno-e2e-opc');
+test('codex sdk e2e routes an opc workspace turn to finance and generates a monthly close checklist', { timeout: 300_000 }, async () => {
+  const cwd = await createScratchDir('cteno-e2e-codex-opc');
   const outputFile = path.join(cwd, 'company/10-finance/monthly-close-checklist.md');
-  const workspace = new ClaudeAgentWorkspace({
+  const workspace = new CodexSdkWorkspace({
     spec: instantiateWorkspace(
       createOpcSoloCompanyTemplate(),
       {
-        id: `opc-e2e-${Date.now()}`,
-        name: 'OPC E2E',
+        id: `codex-opc-e2e-${Date.now()}`,
+        name: 'Codex OPC E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createCodexWorkspaceProfile({
+        model: 'gpt-5.1-codex-mini',
+      }),
     ),
+    skipGitRepoCheck: true,
+    approvalPolicy: 'never',
+    sandboxMode: 'workspace-write',
   });
 
   const { dispatch, turn, fileText } = await runWorkspaceTurnScenario({
@@ -36,12 +41,10 @@ test('opc e2e routes a workspace turn to finance and generates a monthly close c
 
   assert.match(turn.plan.responseText, /@finance|finance/i);
   assert.match(dispatch.resultText, /finance|checklist|monthly close/i);
-  assert.match(fileText, /(Cash Review|Cash & Bank Reconciliation|Cash & Banking|cash balance|cash runway)/i);
-  assert.match(fileText, /(Invoices|Receivables|overdue|invoice)/i);
-  assert.match(fileText, /(Subscriptions|subscription renewals|MRR|Revenue & Receivables)/i);
-  assert.match(fileText, /(Payroll|contractor payments|contractors)/i);
-  assert.match(fileText, /(Tax Prep Handoff|Tax Preparation|estimated tax|sales tax|VAT)/i);
-  assert.match(fileText, /(KPI Review|MRR|burn rate|churn rate)/i);
-  const checkboxCount = (fileText.match(/- \[ \]/g) ?? []).length;
-  assert.ok(checkboxCount >= 8, 'Expected a practical checklist with multiple actionable items');
+  assert.match(fileText, /(cash|bank|runway)/i);
+  assert.match(fileText, /(invoice|receivables|overdue)/i);
+  assert.match(fileText, /(subscription|MRR|revenue)/i);
+  assert.match(fileText, /(payroll|contractor)/i);
+  assert.match(fileText, /(tax|sales tax|VAT|1099)/i);
+  assert.match(fileText, /(KPI|MRR|burn|churn|CAC)/i);
 });

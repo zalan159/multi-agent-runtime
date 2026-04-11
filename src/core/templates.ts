@@ -1,4 +1,6 @@
 import type {
+  ActivityPolicy,
+  ClaimPolicy,
   MultiAgentProvider,
   PermissionMode,
   RoleAgentSpec,
@@ -44,7 +46,10 @@ export interface WorkspaceTemplate {
   templateName: string;
   description?: string;
   defaultRoleId?: string;
+  coordinatorRoleId?: string;
   orchestratorPrompt?: string;
+  claimPolicy?: ClaimPolicy;
+  activityPolicy?: ActivityPolicy;
   roles: TemplateRoleSpec[];
 }
 
@@ -141,6 +146,9 @@ export function instantiateWorkspace(
     ...(profile.disallowedTools ? { disallowedTools: profile.disallowedTools } : {}),
     roles,
     ...(template.defaultRoleId ? { defaultRoleId: template.defaultRoleId } : {}),
+    ...(template.coordinatorRoleId ? { coordinatorRoleId: template.coordinatorRoleId } : {}),
+    ...(template.claimPolicy ? { claimPolicy: template.claimPolicy } : {}),
+    ...(template.activityPolicy ? { activityPolicy: template.activityPolicy } : {}),
   };
 }
 

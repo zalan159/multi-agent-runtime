@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{MultiAgentProvider, RoleSpec};
+use crate::{ClaimStatus, MultiAgentProvider, RoleSpec, WorkspaceVisibility};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +25,32 @@ pub enum WorkspaceStatus {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberStatus {
+    Idle,
+    Active,
+    Blocked,
+    Waiting,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceActivityKind {
+    UserMessage,
+    CoordinatorMessage,
+    MemberClaimed,
+    MemberProgress,
+    MemberBlocked,
+    MemberDelivered,
+    MemberSummary,
+    DispatchStarted,
+    DispatchProgress,
+    DispatchCompleted,
+    SystemNotice,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDispatch {
@@ -34,6 +60,10 @@ pub struct TaskDispatch {
     pub instruction: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<WorkspaceVisibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_role_id: Option<String>,
     pub status: DispatchStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_task_id: Option<String>,
@@ -50,6 +80,47 @@ pub struct TaskDispatch {
     pub last_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by_member_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_status: Option<ClaimStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMember {
+    pub member_id: String,
+    pub workspace_id: String,
+    pub role_id: String,
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub status: MemberStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_state_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceActivity {
+    pub activity_id: Uuid,
+    pub workspace_id: String,
+    pub kind: WorkspaceActivityKind,
+    pub visibility: WorkspaceVisibility,
+    pub text: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,5 +134,7 @@ pub struct WorkspaceState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     pub roles: BTreeMap<String, RoleSpec>,
+    pub members: BTreeMap<String, WorkspaceMember>,
     pub dispatches: BTreeMap<Uuid, TaskDispatch>,
+    pub activities: Vec<WorkspaceActivity>,
 }
