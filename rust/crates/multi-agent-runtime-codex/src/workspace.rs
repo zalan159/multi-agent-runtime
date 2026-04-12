@@ -7,10 +7,15 @@ use std::time::Duration;
 
 use chrono::Utc;
 use multi_agent_protocol::{
-    instantiate_workspace, DispatchStatus, RoleSpec, RoleTaskRequest, TaskDispatch, WorkspaceEvent,
-    WorkspaceInstanceParams, WorkspaceProfile, WorkspaceSpec, WorkspaceTemplate,
+    build_workflow_entry_plan, decide_coordinator_action, direct_workspace_turn_plan,
+    instantiate_workspace, resolve_workflow_vote_candidate_role_ids,
+    should_approve_workflow_vote, synthesize_workflow_vote_response, ClaimStatus, DispatchStatus,
+    RoleSpec, RoleTaskRequest, TaskDispatch, WorkspaceEvent, WorkspaceInstanceParams,
+    WorkspaceProfile, WorkspaceSpec, WorkspaceState, WorkspaceTemplate, WorkspaceTurnPlan,
+    WorkspaceTurnRequest, WorkspaceWorkflowVoteResponse, WorkspaceWorkflowVoteWindow,
 };
 use multi_agent_runtime_core::{RuntimeError, WorkspaceRuntime};
+use multi_agent_runtime_local::{LocalWorkspacePersistence, LocalPersistenceError, PersistedProviderState};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -64,6 +69,7 @@ pub struct CodexWorkspaceOptions {
     pub temp_directory_name: String,
     pub skip_git_repo_check: bool,
     pub turn_timeout: Duration,
+    pub max_workflow_followups: usize,
 }
 
 impl Default for CodexWorkspaceOptions {
@@ -77,6 +83,7 @@ impl Default for CodexWorkspaceOptions {
             temp_directory_name: ".codex-tmp".to_string(),
             skip_git_repo_check: true,
             turn_timeout: Duration::from_secs(240),
+            max_workflow_followups: 0,
         }
     }
 }
@@ -85,6 +92,17 @@ impl Default for CodexWorkspaceOptions {
 pub struct CodexRoleTaskRun {
     pub dispatch: TaskDispatch,
     pub events: Vec<WorkspaceEvent>,
+}
+
+#[derive(Debug)]
+pub struct CodexWorkspaceTurnRun {
+    pub request: WorkspaceTurnRequest,
+    pub plan: WorkspaceTurnPlan,
+    pub workflow_vote_window: Option<WorkspaceWorkflowVoteWindow>,
+    pub workflow_vote_responses: Vec<WorkspaceWorkflowVoteResponse>,
+    pub dispatches: Vec<TaskDispatch>,
+    pub events: Vec<WorkspaceEvent>,
+    pub state: WorkspaceState,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +127,8 @@ pub enum CodexAdapterError {
     TurnFailed(String),
     #[error("codex timed out after {timeout:?}\n{debug}")]
     TimedOut { timeout: Duration, debug: String },
+    #[error("local persistence error: {0}")]
+    LocalPersistence(#[from] LocalPersistenceError),
 }
 
 pub struct CodexWorkspace {
@@ -116,15 +136,20 @@ pub struct CodexWorkspace {
     options: CodexWorkspaceOptions,
     started: bool,
     role_thread_ids: BTreeMap<String, String>,
+    persistence: Option<LocalWorkspacePersistence>,
+    restored_from_persistence: bool,
 }
 
 impl CodexWorkspace {
     pub fn new(spec: WorkspaceSpec, options: CodexWorkspaceOptions) -> Self {
+        let persistence = LocalWorkspacePersistence::from_spec(&spec).ok();
         Self {
             runtime: WorkspaceRuntime::new(spec),
             options,
             started: false,
             role_thread_ids: BTreeMap::new(),
+            persistence,
+            restored_from_persistence: false,
         }
     }
 
@@ -137,8 +162,34 @@ impl CodexWorkspace {
         Self::new(instantiate_workspace(template, instance, profile), options)
     }
 
+    pub fn restore_from_local(
+        cwd: impl AsRef<std::path::Path>,
+        workspace_id: &str,
+        options: CodexWorkspaceOptions,
+    ) -> Result<Self, CodexAdapterError> {
+        let persistence = LocalWorkspacePersistence::from_workspace(cwd, workspace_id);
+        let spec = persistence.load_workspace_spec()?;
+        let state = persistence.load_workspace_state()?;
+        let history = persistence.load_events()?;
+        let provider_state = persistence.load_provider_state()?;
+
+        let mut workspace = Self::new(spec, options);
+        workspace.runtime.restore_snapshot(state, history);
+        workspace.role_thread_ids = provider_state
+            .member_bindings
+            .into_iter()
+            .map(|(role_id, binding)| (role_id, binding.provider_conversation_id))
+            .collect();
+        workspace.restored_from_persistence = true;
+        Ok(workspace)
+    }
+
     pub fn runtime(&self) -> &WorkspaceRuntime {
         &self.runtime
+    }
+
+    pub fn persistence_root(&self) -> Option<&std::path::Path> {
+        self.persistence.as_ref().map(|p| p.root())
     }
 
     pub fn start(&mut self) -> Vec<WorkspaceEvent> {
@@ -147,6 +198,11 @@ impl CodexWorkspace {
         }
 
         self.started = true;
+        if !self.restored_from_persistence {
+            if let Some(persistence) = self.persistence.as_ref() {
+                let _ = persistence.ensure_workspace_initialized(self.runtime.spec());
+            }
+        }
         let mut emitted = Vec::new();
         emitted.extend(self.runtime.start().emitted);
         emitted.extend(
@@ -168,12 +224,196 @@ impl CodexWorkspace {
                 )
                 .emitted,
         );
+        let _ = self.persist_runtime(&emitted);
         emitted
+    }
+
+    pub fn delete_workspace(&mut self) -> Result<(), CodexAdapterError> {
+        self.started = false;
+        self.role_thread_ids.clear();
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_workspace()?;
+        }
+        Ok(())
     }
 
     pub async fn run_role_task(
         &mut self,
         request: RoleTaskRequest,
+    ) -> Result<CodexRoleTaskRun, CodexAdapterError> {
+        let run = self.execute_assignment(request, None).await?;
+        self.persist_runtime(&run.events)?;
+        Ok(run)
+    }
+
+    pub async fn run_workspace_turn(
+        &mut self,
+        request: WorkspaceTurnRequest,
+    ) -> Result<CodexWorkspaceTurnRun, CodexAdapterError> {
+        let mut events = self.runtime.publish_user_message(request.message.clone()).emitted;
+        let coordinator_decision = decide_coordinator_action(self.runtime.spec(), &request);
+        if !coordinator_decision.response_text.trim().is_empty() {
+            events.extend(
+                self.runtime
+                    .record_role_message(
+                        &self
+                            .runtime
+                            .spec()
+                            .coordinator_role_id
+                            .clone()
+                            .or_else(|| self.runtime.spec().default_role_id.clone())
+                            .unwrap_or_else(|| "coordinator".to_string()),
+                        coordinator_decision.response_text.clone(),
+                        multi_agent_protocol::WorkspaceVisibility::Public,
+                        None,
+                        None,
+                    )?
+                    .emitted,
+            );
+        }
+
+        let mut workflow_vote_window = None;
+        let mut workflow_vote_responses = Vec::new();
+        let plan = match coordinator_decision.kind {
+            multi_agent_protocol::CoordinatorDecisionKind::Respond => WorkspaceTurnPlan {
+                coordinator_role_id: self
+                    .runtime
+                    .spec()
+                    .coordinator_role_id
+                    .clone()
+                    .or_else(|| self.runtime.spec().default_role_id.clone())
+                    .unwrap_or_else(|| "coordinator".to_string()),
+                response_text: coordinator_decision.response_text.clone(),
+                assignments: Vec::new(),
+                rationale: coordinator_decision.rationale.clone(),
+            },
+            multi_agent_protocol::CoordinatorDecisionKind::Delegate => {
+                if let Some(target_role_id) = coordinator_decision.target_role_id.clone() {
+                    direct_workspace_turn_plan(self.runtime.spec(), &request, &target_role_id)
+                } else {
+                    multi_agent_protocol::plan_workspace_turn(self.runtime.spec(), &request)
+                }
+            }
+            multi_agent_protocol::CoordinatorDecisionKind::ProposeWorkflow => {
+                let candidate_role_ids =
+                    resolve_workflow_vote_candidate_role_ids(self.runtime.spec());
+                let vote_tick = self.runtime.open_workflow_vote_window(
+                    request.clone(),
+                    coordinator_decision.clone(),
+                    candidate_role_ids.clone(),
+                );
+                events.extend(vote_tick.emitted);
+                let vote_window = vote_tick.state.workflow_runtime.active_vote_window.clone();
+                workflow_vote_window = vote_window.clone();
+                for role_id in candidate_role_ids {
+                    if let Some(role) = self
+                        .runtime
+                        .spec()
+                        .roles
+                        .iter()
+                        .find(|role| role.id == role_id)
+                    {
+                        let response = synthesize_workflow_vote_response(
+                            self.runtime.spec(),
+                            &request,
+                            &coordinator_decision,
+                            role,
+                        );
+                        workflow_vote_responses.push(response.clone());
+                        if let Some(vote_window) = vote_window.as_ref() {
+                            events.extend(
+                                self.runtime
+                                    .record_workflow_vote_response(vote_window, response)?
+                                    .emitted,
+                            );
+                        }
+                    }
+                }
+                let approved =
+                    should_approve_workflow_vote(self.runtime.spec(), &workflow_vote_responses);
+                if let Some(vote_window) = vote_window.clone() {
+                    events.extend(
+                        self.runtime
+                            .close_workflow_vote_window(
+                                vote_window.clone(),
+                                coordinator_decision.clone(),
+                                workflow_vote_responses.clone(),
+                                approved,
+                            )
+                            .emitted,
+                    );
+                }
+                if approved {
+                    let plan = build_workflow_entry_plan(self.runtime.spec(), &request);
+                    let first_assignment = plan.assignments.first();
+                    events.extend(
+                        self.runtime
+                            .start_workflow(
+                                coordinator_decision.clone(),
+                                workflow_vote_window.clone(),
+                                Some(request.message.clone()),
+                                first_assignment.and_then(|assignment| assignment.workflow_node_id.clone()),
+                                first_assignment.and_then(|assignment| assignment.stage_id.clone()),
+                            )
+                            .emitted,
+                    );
+                    plan
+                } else {
+                    WorkspaceTurnPlan {
+                        coordinator_role_id: self
+                            .runtime
+                            .spec()
+                            .coordinator_role_id
+                            .clone()
+                            .or_else(|| self.runtime.spec().default_role_id.clone())
+                            .unwrap_or_else(|| "coordinator".to_string()),
+                        response_text: coordinator_decision.response_text.clone(),
+                        assignments: Vec::new(),
+                        rationale: Some(
+                            "Workflow vote rejected; staying in group chat mode.".to_string(),
+                        ),
+                    }
+                }
+            }
+        };
+
+        let mut dispatches = Vec::new();
+        for assignment in &plan.assignments {
+            let (mut chained_dispatches, chained_events) = self
+                .execute_assignment_chain(
+                    RoleTaskRequest {
+                        role_id: assignment.role_id.clone(),
+                        instruction: assignment.instruction.clone(),
+                        summary: assignment.summary.clone(),
+                        visibility: assignment.visibility,
+                        source_role_id: Some(plan.coordinator_role_id.clone()),
+                        workflow_node_id: assignment.workflow_node_id.clone(),
+                        stage_id: assignment.stage_id.clone(),
+                    },
+                    Some("Claimed by runtime routing".to_string()),
+                )
+                .await?;
+            events.extend(chained_events);
+            dispatches.append(&mut chained_dispatches);
+        }
+
+        let run = CodexWorkspaceTurnRun {
+            request,
+            plan,
+            workflow_vote_window,
+            workflow_vote_responses,
+            dispatches,
+            events,
+            state: self.runtime.snapshot(),
+        };
+        self.persist_runtime(&run.events)?;
+        Ok(run)
+    }
+
+    async fn execute_assignment(
+        &mut self,
+        request: RoleTaskRequest,
+        claim_note: Option<String>,
     ) -> Result<CodexRoleTaskRun, CodexAdapterError> {
         let role = self
             .runtime
@@ -186,6 +426,26 @@ impl CodexWorkspace {
 
         let (dispatch, queued_tick) = self.runtime.queue_dispatch(request)?;
         let mut emitted = queued_tick.emitted;
+
+        let should_claim = self
+            .runtime
+            .snapshot()
+            .dispatches
+            .get(&dispatch.dispatch_id)
+            .and_then(|stored| stored.claim_status)
+            != Some(ClaimStatus::Claimed);
+        if should_claim {
+            emitted.extend(
+                self.runtime
+                    .claim_dispatch(
+                        dispatch.dispatch_id,
+                        &role.id,
+                        ClaimStatus::Claimed,
+                        claim_note,
+                    )?
+                    .emitted,
+            );
+        }
 
         let provider_result = self.execute_provider_turn(&role, &dispatch).await?;
         emitted.extend(provider_result.events);
@@ -201,6 +461,37 @@ impl CodexWorkspace {
             dispatch: final_dispatch,
             events: emitted,
         })
+    }
+
+    async fn execute_assignment_chain(
+        &mut self,
+        request: RoleTaskRequest,
+        claim_note: Option<String>,
+    ) -> Result<(Vec<TaskDispatch>, Vec<WorkspaceEvent>), CodexAdapterError> {
+        let mut dispatches = Vec::new();
+        let mut events = Vec::new();
+        let mut pending = vec![(request, claim_note)];
+
+        let mut followup_budget = self.options.max_workflow_followups;
+        while let Some((request, claim_note)) = pending.pop() {
+            let run = self.execute_assignment(request, claim_note).await?;
+            let provider_task_id = run.dispatch.provider_task_id.clone();
+            events.extend(run.events);
+            dispatches.push(run.dispatch.clone());
+
+            if let Some(provider_task_id) = provider_task_id {
+                let (advance_tick, mut followups) =
+                    self.runtime.advance_workflow_after_dispatch(&provider_task_id)?;
+                events.extend(advance_tick.emitted);
+                while followup_budget > 0 {
+                    let Some(followup) = followups.pop() else { break };
+                    followup_budget -= 1;
+                    pending.push((followup, Some("Claimed by workflow progression".to_string())));
+                }
+            }
+        }
+
+        Ok((dispatches, events))
     }
 
     async fn execute_provider_turn(
@@ -562,6 +853,38 @@ impl CodexWorkspace {
             dispatch: final_dispatch,
             events: emitted,
         })
+    }
+
+    fn build_provider_state(&self) -> PersistedProviderState {
+        PersistedProviderState {
+            workspace_id: self.runtime.spec().id.clone(),
+            provider: multi_agent_protocol::MultiAgentProvider::CodexSdk,
+            root_conversation_id: self.runtime.snapshot().session_id,
+            member_bindings: self
+                .role_thread_ids
+                .iter()
+                .map(|(role_id, thread_id)| {
+                    (
+                        role_id.clone(),
+                        multi_agent_runtime_local::PersistedProviderBinding {
+                            role_id: role_id.clone(),
+                            provider_conversation_id: thread_id.clone(),
+                            kind: multi_agent_runtime_local::ProviderConversationKind::Thread,
+                            updated_at: Utc::now().to_rfc3339(),
+                        },
+                    )
+                })
+                .collect(),
+            metadata: None,
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn persist_runtime(&self, events: &[WorkspaceEvent]) -> Result<(), CodexAdapterError> {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.persist_runtime(&self.runtime.snapshot(), events, &self.build_provider_state())?;
+        }
+        Ok(())
     }
 }
 

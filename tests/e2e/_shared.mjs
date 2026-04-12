@@ -3,6 +3,14 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+export function resolveClaudeTestModel() {
+  return process.env.MULTI_AGENT_TEST_CLAUDE_MODEL || 'claude-sonnet-4-5';
+}
+
+export function resolveCodexTestModel() {
+  return process.env.MULTI_AGENT_TEST_CODEX_MODEL || 'gpt-5.1-codex-mini';
+}
+
 export async function createScratchDir(prefix) {
   return fs.mkdtemp(path.join(os.tmpdir(), `${prefix}-`));
 }
@@ -75,6 +83,9 @@ export async function runWorkspaceTurnScenario({
   outputFile,
   timeoutMs = 180_000,
   resultTimeoutMs = 20_000,
+  expectClaimWindow = false,
+  expectWorkflowVote = false,
+  expectWorkflowStart = false,
 }) {
   const events = [];
   const stopListening = workspace.onEvent(event => {
@@ -114,9 +125,29 @@ export async function runWorkspaceTurnScenario({
     const resultEvent = events.find(
       event => event.type === 'dispatch.result' && event.dispatch.dispatchId === dispatch.dispatchId,
     );
+    const claimWindowOpened = events.find(event => event.type === 'claim.window.opened');
+    const claimResponses = events.filter(event => event.type === 'claim.response');
+    const claimWindowClosed = events.find(event => event.type === 'claim.window.closed');
+    const workflowVoteOpened = events.find(event => event.type === 'workflow.vote.opened');
+    const workflowVoteResponses = events.filter(event => event.type === 'workflow.vote.response');
+    const workflowVoteClosed = events.find(event => event.type === 'workflow.vote.closed');
+    const workflowStarted = events.find(event => event.type === 'workflow.started');
 
     assert.ok(userMessageEvent, 'Expected a public user_message activity');
     assert.ok(coordinatorActivity, 'Expected a public coordinator_message activity');
+    if (expectClaimWindow) {
+      assert.ok(claimWindowOpened, 'Expected claim.window.opened event');
+      assert.ok(claimResponses.length >= 1, 'Expected claim.response events');
+      assert.ok(claimWindowClosed, 'Expected claim.window.closed event');
+    }
+    if (expectWorkflowVote) {
+      assert.ok(workflowVoteOpened, 'Expected workflow.vote.opened event');
+      assert.ok(workflowVoteResponses.length >= 1, 'Expected workflow.vote.response events');
+      assert.ok(workflowVoteClosed, 'Expected workflow.vote.closed event');
+    }
+    if (expectWorkflowStart) {
+      assert.ok(workflowStarted, 'Expected workflow.started event');
+    }
     assert.ok(
       claimedEvent || dispatch.claimStatus === 'claimed',
       'Expected the selected member to claim the dispatch',

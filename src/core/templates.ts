@@ -1,10 +1,13 @@
 import type {
   ActivityPolicy,
   ClaimPolicy,
+  CompletionPolicy,
   MultiAgentProvider,
   PermissionMode,
   RoleAgentSpec,
   RoleSpec,
+  WorkflowArtifactSpec,
+  WorkflowSpec,
   WorkspaceSpec,
 } from './types.js';
 
@@ -50,6 +53,9 @@ export interface WorkspaceTemplate {
   orchestratorPrompt?: string;
   claimPolicy?: ClaimPolicy;
   activityPolicy?: ActivityPolicy;
+  workflow?: WorkflowSpec;
+  artifacts?: WorkflowArtifactSpec[];
+  completionPolicy?: CompletionPolicy;
   roles: TemplateRoleSpec[];
 }
 
@@ -149,6 +155,9 @@ export function instantiateWorkspace(
     ...(template.coordinatorRoleId ? { coordinatorRoleId: template.coordinatorRoleId } : {}),
     ...(template.claimPolicy ? { claimPolicy: template.claimPolicy } : {}),
     ...(template.activityPolicy ? { activityPolicy: template.activityPolicy } : {}),
+    ...(template.workflow ? { workflow: template.workflow } : {}),
+    ...(template.artifacts ? { artifacts: template.artifacts } : {}),
+    ...(template.completionPolicy ? { completionPolicy: template.completionPolicy } : {}),
   };
 }
 

@@ -8,6 +8,7 @@
 - 定义角色型 Agent 和 coordinator
 - 接收一条工作间级别的用户输入，并在团队内部完成路由
 - 建模工作间成员、公开动态和 claim 规则
+- 在 template 中声明工作流：阶段、节点、边、交付物、完成策略
 - 以统一事件流观察任务生命周期
 - 用真实 Claude 调用做端到端验收
 
@@ -218,6 +219,38 @@ await workspace.close();
 - `member.state.changed`
 - `activity.published`
 - `dispatch.claimed`
+
+## Workflow Template v3
+
+现在 template 除了角色和 claim policy 之外，也可以携带声明式 workflow。当前 runtime 还没有把每一种节点都原生执行到底，但协议、内置模板和嵌入层已经会保留这些结构，方便后续把可靠循环、门禁和交付规则真正下沉到运行时。
+
+当前工作流对象包括：
+- `workflow.mode`
+- `workflow.stages`
+- `workflow.nodes`
+- `workflow.edges`
+- `artifacts`
+- `completionPolicy`
+
+当前节点集合包括：
+- `announce`
+- `assign`
+- `claim`
+- `shell`
+- `evaluate`
+- `review`
+- `branch`
+- `loop`
+- `artifact`
+- `commit`
+- `revert`
+- `merge`
+- `complete`
+
+现在已经可以用这套结构表达：
+- 编码循环：`claim -> prd -> review -> architecture -> implement -> test -> review -> complete`
+- autoresearch 循环：`frame -> claim evidence -> shell run -> evaluate -> keep/discard -> loop`
+- 三省六部治理流：`draft -> review -> dispatch -> execute -> compliance -> final review`
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`

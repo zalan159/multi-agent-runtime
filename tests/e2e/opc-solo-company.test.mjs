@@ -8,7 +8,11 @@ import {
   createOpcSoloCompanyTemplate,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  createScratchDir,
+  resolveClaudeTestModel,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
 test('opc e2e routes a workspace turn to finance and generates a monthly close checklist', { timeout: 300_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-opc');
@@ -21,7 +25,9 @@ test('opc e2e routes a workspace turn to finance and generates a monthly close c
         name: 'OPC E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createClaudeWorkspaceProfile({
+        model: resolveClaudeTestModel(),
+      }),
     ),
   });
 

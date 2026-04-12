@@ -2,6 +2,7 @@
 members = [
   "crates/multi-agent-protocol",
   "crates/multi-agent-runtime-core",
+  "crates/multi-agent-runtime-local",
   "crates/multi-agent-runtime-claude",
   "crates/multi-agent-runtime-codex",
   "crates/multi-agent-runtime-cteno",
@@ -21,3 +22,4 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+regex = "1"

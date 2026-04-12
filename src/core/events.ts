@@ -1,10 +1,15 @@
 import type {
+  WorkspaceClaimResponse,
+  WorkspaceClaimWindow,
   ClaimStatus,
+  CoordinatorWorkflowDecision,
   TaskDispatch,
   WorkspaceActivity,
   WorkspaceMember,
   WorkspaceSpec,
   WorkspaceVisibility,
+  WorkspaceWorkflowVoteResponse,
+  WorkspaceWorkflowVoteWindow,
 } from './types.js';
 
 export interface BaseWorkspaceEvent {
@@ -57,6 +62,59 @@ export interface DispatchClaimedEvent extends BaseWorkspaceEvent {
   member: WorkspaceMember;
   claimStatus: ClaimStatus;
   note?: string;
+}
+
+export interface ClaimWindowOpenedEvent extends BaseWorkspaceEvent {
+  type: 'claim.window.opened';
+  claimWindow: WorkspaceClaimWindow;
+}
+
+export interface ClaimResponseEvent extends BaseWorkspaceEvent {
+  type: 'claim.response';
+  claimWindowId: string;
+  response: WorkspaceClaimResponse;
+}
+
+export interface ClaimWindowClosedEvent extends BaseWorkspaceEvent {
+  type: 'claim.window.closed';
+  claimWindow: WorkspaceClaimWindow;
+  responses: WorkspaceClaimResponse[];
+  selectedRoleIds: string[];
+}
+
+export interface WorkflowVoteWindowOpenedEvent extends BaseWorkspaceEvent {
+  type: 'workflow.vote.opened';
+  coordinatorDecision: CoordinatorWorkflowDecision;
+  voteWindow: WorkspaceWorkflowVoteWindow;
+}
+
+export interface WorkflowVoteResponseEvent extends BaseWorkspaceEvent {
+  type: 'workflow.vote.response';
+  voteId: string;
+  response: WorkspaceWorkflowVoteResponse;
+}
+
+export interface WorkflowVoteWindowClosedEvent extends BaseWorkspaceEvent {
+  type: 'workflow.vote.closed';
+  coordinatorDecision: CoordinatorWorkflowDecision;
+  voteWindow: WorkspaceWorkflowVoteWindow;
+  responses: WorkspaceWorkflowVoteResponse[];
+  approved: boolean;
+}
+
+export interface WorkflowStartedEvent extends BaseWorkspaceEvent {
+  type: 'workflow.started';
+  coordinatorDecision: CoordinatorWorkflowDecision;
+  voteWindow?: WorkspaceWorkflowVoteWindow;
+  nodeId?: string;
+  stageId?: string;
+}
+
+export interface WorkflowStageEvent extends BaseWorkspaceEvent {
+  type: 'workflow.stage.started' | 'workflow.stage.completed';
+  nodeId: string;
+  stageId?: string;
+  roleId?: string;
 }
 
 export interface ActivityPublishedEvent extends BaseWorkspaceEvent {
@@ -129,6 +187,14 @@ export type WorkspaceEvent =
   | MemberRegisteredEvent
   | MemberStateChangedEvent
   | DispatchClaimedEvent
+  | ClaimWindowOpenedEvent
+  | ClaimResponseEvent
+  | ClaimWindowClosedEvent
+  | WorkflowVoteWindowOpenedEvent
+  | WorkflowVoteResponseEvent
+  | WorkflowVoteWindowClosedEvent
+  | WorkflowStartedEvent
+  | WorkflowStageEvent
   | ActivityPublishedEvent
   | DispatchQueuedEvent
   | DispatchStartedEvent

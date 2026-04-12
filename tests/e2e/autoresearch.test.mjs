@@ -8,11 +8,15 @@ import {
   createClaudeWorkspaceProfile,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { countMarkdownLinks, createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  createScratchDir,
+  resolveClaudeTestModel,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
-test('autoresearch e2e routes a workspace turn to scout and writes a sourced brief', { timeout: 540_000 }, async () => {
+test('autoresearch e2e enters workflow mode and starts at the lead entry node', { timeout: 360_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-autoresearch');
-  const outputFile = path.join(cwd, 'research/10-scout/mention-patterns.md');
+  const outputFile = path.join(cwd, 'research/00-lead/mention-hypothesis.md');
   const workspace = new ClaudeAgentWorkspace({
     spec: instantiateWorkspace(
       createAutoresearchTemplate(),
@@ -21,26 +25,31 @@ test('autoresearch e2e routes a workspace turn to scout and writes a sourced bri
         name: 'Autoresearch E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createClaudeWorkspaceProfile({
+        model: resolveClaudeTestModel(),
+      }),
     ),
   });
 
   const { dispatch, turn, events, fileText } = await runWorkspaceTurnScenario({
     workspace,
     message:
-      'Research how collaboration tools like Slack and GitHub handle @mentions and directed attention, then write a concise brief to research/10-scout/mention-patterns.md with three short source links and a final section called Implications for Cteno.',
-    expectedRoleId: 'scout',
+      'Start the autoresearch workflow for group-chat mention semantics. Frame the current hypothesis for how collaboration tools like Slack and GitHub handle @mentions, and write the initial hypothesis brief to research/00-lead/mention-hypothesis.md with sections for Hypothesis, Success Criteria, and Next Experiment.',
+    expectedRoleId: 'lead',
     outputFile,
-    timeoutMs: 480_000,
+    timeoutMs: 240_000,
     resultTimeoutMs: 30_000,
+    expectWorkflowVote: true,
+    expectWorkflowStart: true,
   });
 
-  assert.match(turn.plan.responseText, /@scout|research/i);
-  const progressEvents = events.filter(event => event.type === 'dispatch.progress' && event.dispatch.dispatchId === dispatch.dispatchId);
-  assert.ok(progressEvents.length >= 2, 'Expected multiple progress updates during research');
-  assert.match(dispatch.resultText, /research|source|Cteno/i);
-  assert.match(fileText, /Implications for Cteno/i);
+  assert.match(turn.plan.responseText, /workflow|@lead|hypothesis/i);
+  assert.match(dispatch.resultText, /hypothesis|experiment|mention/i);
+  assert.match(fileText, /#|##/);
+  assert.match(fileText, /Hypothesis/i);
+  assert.match(fileText, /Success Criteria/i);
+  assert.match(fileText, /Next Experiment/i);
   assert.match(fileText, /Slack/i);
   assert.match(fileText, /GitHub/i);
-  assert.ok(countMarkdownLinks(fileText) >= 3, 'Expected at least three source links in the research brief');
+  assert.ok(fileText.split(/\s+/).length >= 40, 'Expected a substantive workflow-entry brief');
 });

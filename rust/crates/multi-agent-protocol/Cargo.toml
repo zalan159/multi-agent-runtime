@@ -12,3 +12,4 @@ description = "Provider-neutral protocol objects and event types for multi-agent
 chrono.workspace = true
 serde.workspace = true
 uuid.workspace = true
+regex.workspace = true

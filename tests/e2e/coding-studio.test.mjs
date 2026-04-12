@@ -8,7 +8,11 @@ import {
   createCodingStudioTemplate,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  createScratchDir,
+  resolveClaudeTestModel,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
 test('coding studio e2e routes a workspace turn to the prd role and generates a usable PRD', { timeout: 240_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-coding');
@@ -21,7 +25,9 @@ test('coding studio e2e routes a workspace turn to the prd role and generates a 
         name: 'Coding E2E',
         cwd,
       },
-      createClaudeWorkspaceProfile(),
+      createClaudeWorkspaceProfile({
+        model: resolveClaudeTestModel(),
+      }),
     ),
   });
 
@@ -31,6 +37,7 @@ test('coding studio e2e routes a workspace turn to the prd role and generates a 
       'We need a short PRD for a group-chat mention feature. Please create it at 10-prd/group-mentions.md with sections for Goal, User Story, Scope, Non-Goals, and Acceptance Criteria. Keep it under 250 words.',
     expectedRoleId: 'prd',
     outputFile,
+    expectClaimWindow: true,
   });
 
   assert.match(turn.plan.responseText, /@prd|PRD/i);

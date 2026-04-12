@@ -1,6 +1,7 @@
 export * from './core/types.js';
 export * from './core/events.js';
 export * from './core/templates.js';
+export * from './core/localPersistence.js';
 export * from './core/workspaceTurn.js';
 export * from './adapters/claude/claudeAgentWorkspace.js';
 export * from './adapters/codex/codexSdkWorkspace.js';

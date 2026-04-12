@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ClaimStatus, MultiAgentProvider, RoleSpec, WorkspaceVisibility};
+use crate::{
+    ClaimStatus, MultiAgentProvider, RoleSpec, WorkspaceVisibility, WorkspaceWorkflowVoteWindow,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,14 +39,33 @@ pub enum MemberStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    GroupChat,
+    WorkflowVote,
+    WorkflowRunning,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceActivityKind {
     UserMessage,
     CoordinatorMessage,
+    ClaimWindowOpened,
+    ClaimWindowClosed,
     MemberClaimed,
+    MemberSupporting,
+    MemberDeclined,
     MemberProgress,
     MemberBlocked,
     MemberDelivered,
     MemberSummary,
+    WorkflowVoteOpened,
+    WorkflowVoteApproved,
+    WorkflowVoteRejected,
+    WorkflowStarted,
+    WorkflowStageStarted,
+    WorkflowStageCompleted,
+    WorkflowCompleted,
     DispatchStarted,
     DispatchProgress,
     DispatchCompleted,
@@ -64,6 +85,10 @@ pub struct TaskDispatch {
     pub visibility: Option<WorkspaceVisibility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_role_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
     pub status: DispatchStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_task_id: Option<String>,
@@ -125,6 +150,20 @@ pub struct WorkspaceActivity {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceWorkflowRuntimeState {
+    pub mode: WorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vote_window: Option<WorkspaceWorkflowVoteWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_request_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_stage_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceState {
     pub workspace_id: String,
     pub status: WorkspaceStatus,
@@ -137,4 +176,5 @@ pub struct WorkspaceState {
     pub members: BTreeMap<String, WorkspaceMember>,
     pub dispatches: BTreeMap<Uuid, TaskDispatch>,
     pub activities: Vec<WorkspaceActivity>,
+    pub workflow_runtime: WorkspaceWorkflowRuntimeState,
 }

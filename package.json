@@ -23,7 +23,7 @@
     "smoke:opc": "npm run build && node ./examples/opc-solo-company.mjs",
     "smoke:autoresearch": "npm run build && node ./examples/autoresearch.mjs",
     "e2e:coding": "npm run build && node --test ./tests/e2e/coding-studio.test.mjs",
-    "e2e:codex": "npm run build && node --test ./tests/e2e/codex-coding-studio.test.mjs ./tests/e2e/codex-opc-solo-company.test.mjs ./tests/e2e/codex-autoresearch.test.mjs",
+    "e2e:codex": "npm run build && node --test --test-concurrency=1 ./tests/e2e/codex-coding-studio.test.mjs ./tests/e2e/codex-opc-solo-company.test.mjs ./tests/e2e/codex-autoresearch.test.mjs",
     "e2e:codex:coding": "npm run build && node --test ./tests/e2e/codex-coding-studio.test.mjs",
     "e2e:codex:opc": "npm run build && node --test ./tests/e2e/codex-opc-solo-company.test.mjs",
     "e2e:codex:autoresearch": "npm run build && node --test ./tests/e2e/codex-autoresearch.test.mjs",

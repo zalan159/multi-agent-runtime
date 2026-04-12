@@ -18,6 +18,17 @@ struct FakeProvisioner {
 
 #[async_trait]
 impl WorkspaceProvisioner for FakeProvisioner {
+    async fn prepare_workspace_layout(
+        &self,
+        spec: &multi_agent_protocol::WorkspaceSpec,
+    ) -> Result<(), AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("prepare:{}", spec.id));
+        Ok(())
+    }
+
     async fn create_workspace_persona(
         &self,
         spec: &multi_agent_protocol::WorkspaceSpec,
@@ -53,6 +64,18 @@ impl WorkspaceProvisioner for FakeProvisioner {
             .unwrap()
             .push(format!("session:{}", role.id));
         Ok(format!("session-{}", role.id))
+    }
+
+    async fn cleanup_workspace(
+        &self,
+        spec: &multi_agent_protocol::WorkspaceSpec,
+        _bootstrapped: &multi_agent_runtime_cteno::BootstrappedWorkspace,
+    ) -> Result<(), AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("cleanup:{}", spec.id));
+        Ok(())
     }
 }
 
@@ -155,6 +178,8 @@ async fn run_template_dispatch_flow(
             summary: Some(format!("summary for {}", role_id)),
             visibility: None,
             source_role_id: None,
+            workflow_node_id: None,
+            stage_id: None,
         })
         .await
         .expect("assign role task should succeed");
@@ -215,6 +240,7 @@ async fn run_template_dispatch_flow(
             "provider task completed",
             Some(format!("final result for {}", role_id)),
         )
+        .await
         .expect("complete provider task should succeed");
 
     assert_eq!(complete_events.len(), 3);

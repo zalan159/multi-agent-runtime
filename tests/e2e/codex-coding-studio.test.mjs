@@ -8,7 +8,11 @@ import {
   createCodexWorkspaceProfile,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  createScratchDir,
+  resolveCodexTestModel,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
 test('codex sdk e2e routes a workspace turn to a reusable prd role thread', { timeout: 240_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-codex-coding');
@@ -22,7 +26,7 @@ test('codex sdk e2e routes a workspace turn to a reusable prd role thread', { ti
         cwd,
       },
       createCodexWorkspaceProfile({
-        model: 'gpt-5.1-codex-mini',
+        model: resolveCodexTestModel(),
       }),
     ),
     skipGitRepoCheck: true,
@@ -38,6 +42,7 @@ test('codex sdk e2e routes a workspace turn to a reusable prd role thread', { ti
     outputFile,
     timeoutMs: 180_000,
     resultTimeoutMs: 20_000,
+    expectClaimWindow: true,
   });
 
   assert.match(turn.plan.responseText, /@prd|PRD/i);

@@ -8,7 +8,11 @@ import {
   createOpcSoloCompanyTemplate,
   instantiateWorkspace,
 } from '../../dist/index.js';
-import { createScratchDir, runWorkspaceTurnScenario } from './_shared.mjs';
+import {
+  createScratchDir,
+  resolveCodexTestModel,
+  runWorkspaceTurnScenario,
+} from './_shared.mjs';
 
 test('codex sdk e2e routes an opc workspace turn to finance and generates a monthly close checklist', { timeout: 300_000 }, async () => {
   const cwd = await createScratchDir('cteno-e2e-codex-opc');
@@ -22,7 +26,7 @@ test('codex sdk e2e routes an opc workspace turn to finance and generates a mont
         cwd,
       },
       createCodexWorkspaceProfile({
-        model: 'gpt-5.1-codex-mini',
+        model: resolveCodexTestModel(),
       }),
     ),
     skipGitRepoCheck: true,

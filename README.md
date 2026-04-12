@@ -8,6 +8,7 @@ This package gives us one unified protocol for:
 - defining role agents and coordinator roles
 - accepting a workspace-level user turn and routing it across the team
 - modeling workspace members, public activity, and claim policies
+- declaring template-level workflows with stages, nodes, edges, artifacts, and completion rules
 - observing task lifecycle as events
 - validating generated artifacts in end-to-end tests
 
@@ -218,6 +219,38 @@ Useful event types:
 - `member.state.changed`
 - `activity.published`
 - `dispatch.claimed`
+
+## Workflow Template v3
+
+Templates can now carry a declarative workflow in addition to roles and claim policy. The runtime does not yet execute every workflow node natively, but the protocol and built-in templates now preserve the structure needed for reliable loops and gates.
+
+Current workflow objects:
+- `workflow.mode`
+- `workflow.stages`
+- `workflow.nodes`
+- `workflow.edges`
+- `artifacts`
+- `completionPolicy`
+
+Current node vocabulary:
+- `announce`
+- `assign`
+- `claim`
+- `shell`
+- `evaluate`
+- `review`
+- `branch`
+- `loop`
+- `artifact`
+- `commit`
+- `revert`
+- `merge`
+- `complete`
+
+That lets us express patterns such as:
+- coding loop: `claim -> prd -> review -> architecture -> implement -> test -> review -> complete`
+- autoresearch loop: `frame -> claim evidence -> shell run -> evaluate -> keep/discard -> loop`
+- governance flow: `draft -> review -> dispatch -> execute -> compliance -> final review`
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`

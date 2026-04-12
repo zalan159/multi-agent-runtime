@@ -1,18 +1,19 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ClaimStatus, TaskDispatch, WorkspaceActivity, WorkspaceMember, WorkspaceSpec, WorkspaceStatus,
-    WorkspaceVisibility,
+    ClaimStatus, CoordinatorWorkflowDecision, TaskDispatch, WorkspaceActivity,
+    WorkspaceClaimResponse, WorkspaceClaimWindow, WorkspaceMember, WorkspaceSpec, WorkspaceStatus,
+    WorkspaceVisibility, WorkspaceWorkflowVoteResponse, WorkspaceWorkflowVoteWindow,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseWorkspaceEvent {
     pub timestamp: String,
     pub workspace_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceEvent {
     WorkspaceStarted {
@@ -72,6 +73,73 @@ pub enum WorkspaceEvent {
         claim_status: ClaimStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    ClaimWindowOpened {
+        timestamp: String,
+        workspace_id: String,
+        claim_window: WorkspaceClaimWindow,
+    },
+    ClaimResponse {
+        timestamp: String,
+        workspace_id: String,
+        claim_window_id: String,
+        response: WorkspaceClaimResponse,
+    },
+    ClaimWindowClosed {
+        timestamp: String,
+        workspace_id: String,
+        claim_window: WorkspaceClaimWindow,
+        responses: Vec<WorkspaceClaimResponse>,
+        selected_role_ids: Vec<String>,
+    },
+    WorkflowVoteOpened {
+        timestamp: String,
+        workspace_id: String,
+        coordinator_decision: CoordinatorWorkflowDecision,
+        vote_window: WorkspaceWorkflowVoteWindow,
+    },
+    WorkflowVoteResponse {
+        timestamp: String,
+        workspace_id: String,
+        vote_id: String,
+        response: WorkspaceWorkflowVoteResponse,
+    },
+    WorkflowVoteClosed {
+        timestamp: String,
+        workspace_id: String,
+        coordinator_decision: CoordinatorWorkflowDecision,
+        vote_window: WorkspaceWorkflowVoteWindow,
+        responses: Vec<WorkspaceWorkflowVoteResponse>,
+        approved: bool,
+    },
+    WorkflowStarted {
+        timestamp: String,
+        workspace_id: String,
+        coordinator_decision: CoordinatorWorkflowDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vote_window: Option<WorkspaceWorkflowVoteWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_id: Option<String>,
+    },
+    WorkflowStageStarted {
+        timestamp: String,
+        workspace_id: String,
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_id: Option<String>,
+    },
+    WorkflowStageCompleted {
+        timestamp: String,
+        workspace_id: String,
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_id: Option<String>,
     },
     DispatchStarted {
         timestamp: String,

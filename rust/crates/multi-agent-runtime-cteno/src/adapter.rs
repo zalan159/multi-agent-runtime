@@ -3,22 +3,27 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::Utc;
 use multi_agent_protocol::{
-    direct_workspace_turn_plan, instantiate_workspace, plan_workspace_turn, ClaimStatus,
-    DispatchStatus, RoleSpec, RoleTaskRequest, TaskDispatch, WorkspaceEvent,
-    WorkspaceInstanceParams, WorkspaceProfile, WorkspaceSpec, WorkspaceState, WorkspaceTemplate,
-    WorkspaceTurnPlan, WorkspaceTurnRequest, WorkspaceVisibility,
+    build_workflow_entry_plan, decide_coordinator_action, direct_workspace_turn_plan,
+    instantiate_workspace, plan_workspace_turn, resolve_workflow_vote_candidate_role_ids,
+    should_approve_workflow_vote, synthesize_workflow_vote_response, ClaimStatus, DispatchStatus,
+    RoleSpec, RoleTaskRequest, TaskDispatch, WorkspaceEvent, WorkspaceInstanceParams,
+    WorkspaceProfile, WorkspaceSpec, WorkspaceState, WorkspaceTemplate, WorkspaceTurnPlan,
+    WorkspaceTurnRequest, WorkspaceVisibility, WorkspaceWorkflowVoteResponse,
+    WorkspaceWorkflowVoteWindow,
 };
 use multi_agent_runtime_core::{RuntimeError, RuntimeTick, WorkspaceRuntime};
+use multi_agent_runtime_local::{LocalPersistenceError, LocalWorkspacePersistence, PersistedProviderBinding, PersistedProviderState, ProviderConversationKind};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisionedRole {
     pub role_id: String,
     pub agent_id: String,
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrappedWorkspace {
     pub workspace_persona_id: String,
     pub workspace_session_id: String,
@@ -27,6 +32,7 @@ pub struct BootstrappedWorkspace {
 
 #[async_trait]
 pub trait WorkspaceProvisioner: Send + Sync {
+    async fn prepare_workspace_layout(&self, spec: &WorkspaceSpec) -> Result<(), AdapterError>;
     async fn create_workspace_persona(&self, spec: &WorkspaceSpec) -> Result<(String, String), AdapterError>;
     async fn create_role_agent(&self, spec: &WorkspaceSpec, role: &RoleSpec) -> Result<String, AdapterError>;
     async fn spawn_role_session(
@@ -36,6 +42,11 @@ pub trait WorkspaceProvisioner: Send + Sync {
         agent_id: &str,
         workspace_persona_id: &str,
     ) -> Result<String, AdapterError>;
+    async fn cleanup_workspace(
+        &self,
+        spec: &WorkspaceSpec,
+        bootstrapped: &BootstrappedWorkspace,
+    ) -> Result<(), AdapterError>;
 }
 
 #[async_trait]
@@ -53,6 +64,10 @@ pub enum AdapterError {
     Messaging(String),
     #[error("missing provisioned role session for role {0}")]
     MissingRoleSession(String),
+    #[error("local persistence error: {0}")]
+    LocalPersistence(#[from] LocalPersistenceError),
+    #[error("provider metadata error: {0}")]
+    Metadata(String),
 }
 
 pub struct CtenoWorkspaceAdapter<P, M> {
@@ -61,12 +76,24 @@ pub struct CtenoWorkspaceAdapter<P, M> {
     messenger: M,
     bootstrapped: Option<BootstrappedWorkspace>,
     role_sessions: BTreeMap<String, String>,
+    persistence: Option<LocalWorkspacePersistence>,
+    restored_from_persistence: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CtenoProviderMetadata {
+    workspace_persona_id: String,
+    workspace_session_id: String,
+    roles: Vec<ProvisionedRole>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceTurnResult {
     pub request: WorkspaceTurnRequest,
     pub plan: WorkspaceTurnPlan,
+    pub workflow_vote_window: Option<WorkspaceWorkflowVoteWindow>,
+    pub workflow_vote_responses: Vec<WorkspaceWorkflowVoteResponse>,
     pub role_id: Option<String>,
     pub session_id: String,
     pub dispatch: Option<TaskDispatch>,
@@ -81,12 +108,15 @@ where
     M: SessionMessenger,
 {
     pub fn new(spec: WorkspaceSpec, provisioner: P, messenger: M) -> Self {
+        let persistence = LocalWorkspacePersistence::from_spec(&spec).ok();
         Self {
             runtime: WorkspaceRuntime::new(spec),
             provisioner,
             messenger,
             bootstrapped: None,
             role_sessions: BTreeMap::new(),
+            persistence,
+            restored_from_persistence: false,
         }
     }
 
@@ -102,6 +132,38 @@ where
             provisioner,
             messenger,
         )
+    }
+
+    pub fn restore_from_local(
+        cwd: impl AsRef<std::path::Path>,
+        workspace_id: &str,
+        provisioner: P,
+        messenger: M,
+    ) -> Result<Self, AdapterError> {
+        let persistence = LocalWorkspacePersistence::from_workspace(cwd, workspace_id);
+        let spec = persistence.load_workspace_spec()?;
+        let state = persistence.load_workspace_state()?;
+        let history = persistence.load_events()?;
+        let provider_state = persistence.load_provider_state()?;
+
+        let mut adapter = Self::new(spec, provisioner, messenger);
+        adapter.runtime.restore_snapshot(state, history);
+        adapter.role_sessions = provider_state
+            .member_bindings
+            .iter()
+            .map(|(role_id, binding)| (role_id.clone(), binding.provider_conversation_id.clone()))
+            .collect();
+        if let Some(metadata) = provider_state.metadata {
+            let decoded: CtenoProviderMetadata = serde_json::from_value(metadata)
+                .map_err(|error| AdapterError::Metadata(error.to_string()))?;
+            adapter.bootstrapped = Some(BootstrappedWorkspace {
+                workspace_persona_id: decoded.workspace_persona_id,
+                workspace_session_id: decoded.workspace_session_id,
+                roles: decoded.roles,
+            });
+        }
+        adapter.restored_from_persistence = true;
+        Ok(adapter)
     }
 
     pub fn runtime(&self) -> &WorkspaceRuntime {
@@ -120,6 +182,10 @@ where
         self.runtime.history()
     }
 
+    pub fn persistence_root(&self) -> Option<&std::path::Path> {
+        self.persistence.as_ref().map(|p| p.root())
+    }
+
     pub fn has_role_session(&self, session_id: &str) -> bool {
         self.role_sessions.values().any(|value| value == session_id)
     }
@@ -127,6 +193,14 @@ where
     pub async fn bootstrap(&mut self) -> Result<Vec<WorkspaceEvent>, AdapterError> {
         let spec = self.runtime.spec().clone();
         let mut emitted = Vec::new();
+
+        if !self.restored_from_persistence {
+            if let Some(persistence) = self.persistence.as_ref() {
+                persistence.ensure_workspace_initialized(&spec)?;
+            }
+        }
+
+        self.provisioner.prepare_workspace_layout(&spec).await?;
 
         emitted.extend(self.runtime.start().emitted);
 
@@ -172,6 +246,8 @@ where
                 .emitted,
         );
 
+        self.persist_runtime(&emitted)?;
+
         Ok(emitted)
     }
 
@@ -204,6 +280,7 @@ where
         );
 
         self.bootstrapped = Some(bootstrapped);
+        self.persist_runtime(&emitted)?;
         Ok(emitted)
     }
 
@@ -222,6 +299,7 @@ where
         self.messenger
             .send_to_session(&role_session_id, &dispatch.instruction)
             .await?;
+        self.persist_runtime(&queued_tick.emitted)?;
 
         Ok((dispatch, queued_tick.emitted))
     }
@@ -238,18 +316,30 @@ where
             prefer_role_id: role_id.map(ToString::to_string),
         };
         let mut events = self.runtime.publish_user_message(message).emitted;
-        let plan = if let Some(role_id) = role_id {
-            direct_workspace_turn_plan(self.runtime.spec(), &request, role_id)
+        let coordinator_decision = if let Some(role_id) = role_id {
+            multi_agent_protocol::CoordinatorWorkflowDecision {
+                kind: multi_agent_protocol::CoordinatorDecisionKind::Delegate,
+                response_text: format!("@{} will take this next.", role_id),
+                target_role_id: Some(role_id.to_string()),
+                workflow_vote_reason: None,
+                rationale: Some("Direct role targeting bypassed coordinator routing.".to_string()),
+            }
         } else {
-            plan_workspace_turn(self.runtime.spec(), &request)
+            decide_coordinator_action(self.runtime.spec(), &request)
         };
 
-        if !plan.response_text.trim().is_empty() {
+        if !coordinator_decision.response_text.trim().is_empty() {
             events.extend(
                 self.runtime
                     .record_role_message(
-                        &plan.coordinator_role_id,
-                        plan.response_text.clone(),
+                        &self
+                            .runtime
+                            .spec()
+                            .coordinator_role_id
+                            .clone()
+                            .or_else(|| self.runtime.spec().default_role_id.clone())
+                            .unwrap_or_else(|| "coordinator".to_string()),
+                        coordinator_decision.response_text.clone(),
                         WorkspaceVisibility::Public,
                         None,
                         None,
@@ -257,6 +347,103 @@ where
                     .emitted,
             );
         }
+
+        let mut workflow_vote_window = None;
+        let mut workflow_vote_responses = Vec::new();
+        let plan = match coordinator_decision.kind {
+            multi_agent_protocol::CoordinatorDecisionKind::Respond => WorkspaceTurnPlan {
+                coordinator_role_id: self
+                    .runtime
+                    .spec()
+                    .coordinator_role_id
+                    .clone()
+                    .or_else(|| self.runtime.spec().default_role_id.clone())
+                    .unwrap_or_else(|| "coordinator".to_string()),
+                response_text: coordinator_decision.response_text.clone(),
+                assignments: Vec::new(),
+                rationale: coordinator_decision.rationale.clone(),
+            },
+            multi_agent_protocol::CoordinatorDecisionKind::Delegate => {
+                if let Some(target_role_id) = coordinator_decision.target_role_id.clone() {
+                    direct_workspace_turn_plan(self.runtime.spec(), &request, &target_role_id)
+                } else {
+                    plan_workspace_turn(self.runtime.spec(), &request)
+                }
+            }
+            multi_agent_protocol::CoordinatorDecisionKind::ProposeWorkflow => {
+                let candidate_role_ids =
+                    resolve_workflow_vote_candidate_role_ids(self.runtime.spec());
+                let vote_tick = self.runtime.open_workflow_vote_window(
+                    request.clone(),
+                    coordinator_decision.clone(),
+                    candidate_role_ids.clone(),
+                );
+                events.extend(vote_tick.emitted);
+                let vote_window = vote_tick.state.workflow_runtime.active_vote_window.clone();
+                workflow_vote_window = vote_window.clone();
+                for role_id in candidate_role_ids {
+                    if let Some(role) = self.runtime.spec().roles.iter().find(|role| role.id == role_id) {
+                        let response = synthesize_workflow_vote_response(
+                            self.runtime.spec(),
+                            &request,
+                            &coordinator_decision,
+                            role,
+                        );
+                        workflow_vote_responses.push(response.clone());
+                        if let Some(vote_window) = vote_window.as_ref() {
+                            events.extend(
+                                self.runtime
+                                    .record_workflow_vote_response(vote_window, response)?
+                                    .emitted,
+                            );
+                        }
+                    }
+                }
+                let approved =
+                    should_approve_workflow_vote(self.runtime.spec(), &workflow_vote_responses);
+                if let Some(vote_window) = vote_window.clone() {
+                    events.extend(
+                        self.runtime
+                            .close_workflow_vote_window(
+                                vote_window.clone(),
+                                coordinator_decision.clone(),
+                                workflow_vote_responses.clone(),
+                                approved,
+                            )
+                            .emitted,
+                    );
+                }
+                if approved {
+                    let plan = build_workflow_entry_plan(self.runtime.spec(), &request);
+                    let first_assignment = plan.assignments.first();
+                    events.extend(
+                        self.runtime
+                            .start_workflow(
+                                coordinator_decision.clone(),
+                                workflow_vote_window.clone(),
+                                Some(request.message.clone()),
+                                first_assignment.and_then(|assignment| assignment.workflow_node_id.clone()),
+                                first_assignment.and_then(|assignment| assignment.stage_id.clone()),
+                            )
+                            .emitted,
+                    );
+                    plan
+                } else {
+                    WorkspaceTurnPlan {
+                        coordinator_role_id: self
+                            .runtime
+                            .spec()
+                            .coordinator_role_id
+                            .clone()
+                            .or_else(|| self.runtime.spec().default_role_id.clone())
+                            .unwrap_or_else(|| "coordinator".to_string()),
+                        response_text: coordinator_decision.response_text.clone(),
+                        assignments: Vec::new(),
+                        rationale: Some("Workflow vote rejected; staying in group chat mode.".to_string()),
+                    }
+                }
+            }
+        };
 
         let Some(primary_assignment) = plan.assignments.first().cloned() else {
             let session_id = self
@@ -269,16 +456,20 @@ where
                     )
                 })?;
             self.messenger.send_to_session(&session_id, message).await?;
-            return Ok(WorkspaceTurnResult {
+            let result = WorkspaceTurnResult {
                 request,
                 plan,
+                workflow_vote_window,
+                workflow_vote_responses,
                 role_id: None,
                 session_id,
                 dispatch: None,
                 dispatches: Vec::new(),
                 events,
                 state: self.runtime.snapshot(),
-            });
+            };
+            self.persist_runtime(&result.events)?;
+            return Ok(result);
         };
 
         let role_session_id = self
@@ -289,67 +480,114 @@ where
 
         let mut dispatches = Vec::new();
         for assignment in &plan.assignments {
-            let role_session_id = self
-                .role_sessions
-                .get(&assignment.role_id)
-                .cloned()
-                .ok_or_else(|| AdapterError::MissingRoleSession(assignment.role_id.clone()))?;
-            let (dispatch, queued_events) = self
-                .assign_role_task(RoleTaskRequest {
-                    role_id: assignment.role_id.clone(),
-                    instruction: assignment.instruction.clone(),
-                    summary: assignment
-                        .summary
-                        .clone()
-                        .or_else(|| Some(summarize_workspace_message(&assignment.instruction))),
-                    visibility: assignment.visibility.or(Some(WorkspaceVisibility::Public)),
-                    source_role_id: Some(plan.coordinator_role_id.clone()),
-                })
+            let mut run_dispatches = self
+                .dispatch_assignment_chain(
+                    RoleTaskRequest {
+                        role_id: assignment.role_id.clone(),
+                        instruction: assignment.instruction.clone(),
+                        summary: assignment
+                            .summary
+                            .clone()
+                            .or_else(|| Some(summarize_workspace_message(&assignment.instruction))),
+                        visibility: assignment.visibility.or(Some(WorkspaceVisibility::Public)),
+                        source_role_id: Some(plan.coordinator_role_id.clone()),
+                        workflow_node_id: assignment.workflow_node_id.clone(),
+                        stage_id: assignment.stage_id.clone(),
+                    },
+                    if role_id.is_some() {
+                        Some("Directly addressed by user".to_string())
+                    } else {
+                        Some("Claimed by coordinator routing".to_string())
+                    },
+                )
                 .await?;
-            events.extend(queued_events);
-            let claim_note = if role_id.is_some() {
-                Some("Directly addressed by user".to_string())
-            } else {
-                Some("Claimed by coordinator routing".to_string())
-            };
-            events.extend(
-                self.runtime
-                    .claim_dispatch(
-                        dispatch.dispatch_id,
-                        &assignment.role_id,
-                        ClaimStatus::Claimed,
-                        claim_note,
-                    )?
-                    .emitted,
-            );
-
-            let synthetic_task_id = format!("cteno:{}:{}", role_session_id, dispatch.dispatch_id);
-            let description = dispatch
-                .summary
-                .clone()
-                .unwrap_or_else(|| dispatch.instruction.clone());
-            events.extend(self.start_provider_task(&synthetic_task_id, &description, None)?);
-
-            let final_dispatch = self
-                .runtime
-                .snapshot()
-                .dispatches
-                .get(&dispatch.dispatch_id)
-                .cloned()
-                .unwrap_or(dispatch);
-            dispatches.push(final_dispatch);
+            events.append(&mut run_dispatches.1);
+            dispatches.append(&mut run_dispatches.0);
         }
 
-        Ok(WorkspaceTurnResult {
+        let result = WorkspaceTurnResult {
             request,
             plan,
+            workflow_vote_window,
+            workflow_vote_responses,
             role_id: Some(primary_assignment.role_id),
             session_id: role_session_id,
             dispatch: dispatches.first().cloned(),
             dispatches,
             events,
             state: self.runtime.snapshot(),
-        })
+        };
+        self.persist_runtime(&result.events)?;
+        Ok(result)
+    }
+
+    async fn dispatch_assignment_chain(
+        &mut self,
+        request: RoleTaskRequest,
+        claim_note: Option<String>,
+    ) -> Result<(Vec<TaskDispatch>, Vec<WorkspaceEvent>), AdapterError> {
+        let dispatch = self.dispatch_assignment_once(request, claim_note).await?;
+        Ok((vec![dispatch.0], dispatch.1))
+    }
+
+    async fn dispatch_assignment_once(
+        &mut self,
+        request: RoleTaskRequest,
+        claim_note: Option<String>,
+    ) -> Result<(TaskDispatch, Vec<WorkspaceEvent>), AdapterError> {
+        let role_session_id = self
+            .role_sessions
+            .get(&request.role_id)
+            .cloned()
+            .ok_or_else(|| AdapterError::MissingRoleSession(request.role_id.clone()))?;
+
+        let (dispatch, queued_tick) = self.runtime.queue_dispatch(request)?;
+        let mut emitted = queued_tick.emitted;
+
+        let should_claim = self
+            .runtime
+            .snapshot()
+            .dispatches
+            .get(&dispatch.dispatch_id)
+            .and_then(|stored| stored.claim_status)
+            != Some(ClaimStatus::Claimed);
+        if should_claim {
+            emitted.extend(
+                self.runtime
+                    .claim_dispatch(
+                        dispatch.dispatch_id,
+                        &dispatch.role_id,
+                        ClaimStatus::Claimed,
+                        claim_note,
+                    )?
+                    .emitted,
+            );
+        }
+
+        self.messenger
+            .send_to_session(&role_session_id, &dispatch.instruction)
+            .await?;
+
+        let provider_task_id = format!("cteno:{}:{}", role_session_id, dispatch.dispatch_id);
+        let (_, started_tick) = self.runtime.start_next_dispatch(
+            provider_task_id,
+            dispatch
+                .summary
+                .clone()
+                .unwrap_or_else(|| summarize_workspace_message(&dispatch.instruction)),
+            None,
+        )?;
+        emitted.extend(started_tick.emitted);
+
+        let final_dispatch = self
+            .runtime
+            .snapshot()
+            .dispatches
+            .get(&dispatch.dispatch_id)
+            .cloned()
+            .expect("dispatch should exist after start_next_dispatch");
+
+        Ok((final_dispatch, emitted))
     }
 
     pub fn start_provider_task(
@@ -358,11 +596,13 @@ where
         description: &str,
         tool_use_id: Option<String>,
     ) -> Result<Vec<WorkspaceEvent>, AdapterError> {
-        Ok(self
+        let events = self
             .runtime
             .start_next_dispatch(provider_task_id.to_string(), description.to_string(), tool_use_id)?
             .1
-            .emitted)
+            .emitted;
+        self.persist_runtime(&events)?;
+        Ok(events)
     }
 
     pub fn progress_provider_task(
@@ -372,13 +612,15 @@ where
         summary: Option<String>,
         last_tool_name: Option<String>,
     ) -> Result<Vec<WorkspaceEvent>, AdapterError> {
-        Ok(self
+        let events = self
             .runtime
             .progress_dispatch(provider_task_id, description.to_string(), summary, last_tool_name)?
-            .emitted)
+            .emitted;
+        self.persist_runtime(&events)?;
+        Ok(events)
     }
 
-    pub fn complete_provider_task(
+    pub async fn complete_provider_task(
         &mut self,
         provider_task_id: &str,
         status: DispatchStatus,
@@ -399,6 +641,20 @@ where
             );
         }
 
+        let (advance_tick, followups) = self.runtime.advance_workflow_after_dispatch(provider_task_id)?;
+        emitted.extend(advance_tick.emitted);
+
+        for followup in followups {
+            let (_, mut followup_events) = self
+                .dispatch_assignment_chain(
+                    followup,
+                    Some("Claimed by workflow progression".to_string()),
+                )
+                .await?;
+            emitted.append(&mut followup_events);
+        }
+
+        self.persist_runtime(&emitted)?;
         Ok(emitted)
     }
 
@@ -415,7 +671,7 @@ where
             })
     }
 
-    pub fn ingest_member_response(
+    pub async fn ingest_member_response(
         &mut self,
         session_id: &str,
         response_text: &str,
@@ -456,20 +712,80 @@ where
             let provider_task_id = dispatch.provider_task_id.unwrap_or_else(|| {
                 format!("cteno:{}:{}", session_id, dispatch.dispatch_id)
             });
-            return self.complete_provider_task(
-                &provider_task_id,
-                if success {
-                    DispatchStatus::Completed
-                } else {
-                    DispatchStatus::Failed
-                },
-                dispatch.output_file,
-                &summary,
-                Some(response_text.to_string()),
-            );
+            return self
+                .complete_provider_task(
+                    &provider_task_id,
+                    if success {
+                        DispatchStatus::Completed
+                    } else {
+                        DispatchStatus::Failed
+                    },
+                    dispatch.output_file,
+                    &summary,
+                    Some(response_text.to_string()),
+                )
+                .await;
         }
 
-        Ok(self.record_message(&role_id, &summary).emitted)
+        let emitted = self.record_message(&role_id, &summary).emitted;
+        self.persist_runtime(&emitted)?;
+        Ok(emitted)
+    }
+
+    pub async fn delete_workspace(&mut self) -> Result<(), AdapterError> {
+        if let Some(bootstrapped) = self.bootstrapped.as_ref() {
+            self.provisioner
+                .cleanup_workspace(self.runtime.spec(), bootstrapped)
+                .await?;
+        }
+        self.role_sessions.clear();
+        self.bootstrapped = None;
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_workspace()?;
+        }
+        Ok(())
+    }
+
+    fn build_provider_state(&self) -> PersistedProviderState {
+        PersistedProviderState {
+            workspace_id: self.runtime.spec().id.clone(),
+            provider: multi_agent_protocol::MultiAgentProvider::Cteno,
+            root_conversation_id: self
+                .bootstrapped
+                .as_ref()
+                .map(|bootstrapped| bootstrapped.workspace_session_id.clone()),
+            member_bindings: self
+                .role_sessions
+                .iter()
+                .map(|(role_id, session_id)| {
+                    (
+                        role_id.clone(),
+                        PersistedProviderBinding {
+                            role_id: role_id.clone(),
+                            provider_conversation_id: session_id.clone(),
+                            kind: ProviderConversationKind::Session,
+                            updated_at: Utc::now().to_rfc3339(),
+                        },
+                    )
+                })
+                .collect(),
+            metadata: self.bootstrapped.as_ref().and_then(|bootstrapped| {
+                serde_json::to_value(CtenoProviderMetadata {
+                    workspace_persona_id: bootstrapped.workspace_persona_id.clone(),
+                    workspace_session_id: bootstrapped.workspace_session_id.clone(),
+                    roles: bootstrapped.roles.clone(),
+                })
+                .ok()
+            }),
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn persist_runtime(&self, events: &[WorkspaceEvent]) -> Result<(), AdapterError> {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.persist_runtime(&self.runtime.snapshot(), events, &self.build_provider_state())?;
+        }
+        Ok(())
     }
 }
 
@@ -489,7 +805,9 @@ fn summarize_workspace_message(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use multi_agent_protocol::{
         create_claude_workspace_profile, create_coding_studio_template, MultiAgentProvider,
@@ -505,6 +823,11 @@ mod tests {
 
     #[async_trait]
     impl WorkspaceProvisioner for FakeProvisioner {
+        async fn prepare_workspace_layout(&self, spec: &WorkspaceSpec) -> Result<(), AdapterError> {
+            self.calls.lock().unwrap().push(format!("prepare:{}", spec.id));
+            Ok(())
+        }
+
         async fn create_workspace_persona(&self, spec: &WorkspaceSpec) -> Result<(String, String), AdapterError> {
             self.calls.lock().unwrap().push(format!("persona:{}", spec.id));
             Ok(("persona-1".to_string(), "session-main".to_string()))
@@ -525,6 +848,18 @@ mod tests {
             self.calls.lock().unwrap().push(format!("session:{}", role.id));
             Ok(format!("session-{}", role.id))
         }
+
+        async fn cleanup_workspace(
+            &self,
+            spec: &WorkspaceSpec,
+            _bootstrapped: &BootstrappedWorkspace,
+        ) -> Result<(), AdapterError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cleanup:{}", spec.id));
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -543,13 +878,26 @@ mod tests {
         }
     }
 
+    fn temp_workspace_dir(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "multi-agent-runtime-cteno-{label}-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
     fn sample_spec() -> WorkspaceSpec {
         WorkspaceSpec {
             id: "workspace-1".to_string(),
             name: "Cteno Workspace".to_string(),
             provider: MultiAgentProvider::Cteno,
             model: "claude-sonnet-4-5".to_string(),
-            cwd: Some("/tmp/workspace".to_string()),
+            cwd: Some(temp_workspace_dir("sample")),
             orchestrator_prompt: None,
             allowed_tools: Some(vec!["Read".to_string(), "Edit".to_string()]),
             disallowed_tools: None,
@@ -559,6 +907,10 @@ mod tests {
             coordinator_role_id: Some("coder".to_string()),
             claim_policy: None,
             activity_policy: None,
+            workflow_vote_policy: None,
+            workflow: None,
+            artifacts: None,
+            completion_policy: None,
             roles: vec![RoleSpec {
                 id: "coder".to_string(),
                 name: "Coder".to_string(),
@@ -598,6 +950,8 @@ mod tests {
                 summary: Some("Mention MVP".to_string()),
                 visibility: None,
                 source_role_id: None,
+                workflow_node_id: None,
+                stage_id: None,
             })
             .await
             .expect("assign role task should succeed");
@@ -722,5 +1076,37 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "session-prd");
         assert_eq!(sent[0].1, "Write the PRD for group mentions");
+    }
+
+    #[tokio::test]
+    async fn restores_and_deletes_local_workspace() {
+        let spec = sample_spec();
+        let cwd = spec.cwd.clone().unwrap();
+        let provisioner = FakeProvisioner::default();
+        let messenger = FakeMessenger::default();
+        let mut adapter =
+            CtenoWorkspaceAdapter::new(spec.clone(), provisioner.clone(), messenger.clone());
+        adapter.bootstrap().await.expect("bootstrap should succeed");
+
+        let persisted_root = adapter
+            .persistence_root()
+            .expect("persistence root should exist")
+            .to_path_buf();
+        assert!(persisted_root.exists());
+
+        let restored =
+            CtenoWorkspaceAdapter::restore_from_local(&cwd, &spec.id, provisioner, messenger)
+                .expect("restore should succeed");
+        assert!(restored.bootstrapped().is_some());
+        assert!(restored.has_role_session("session-coder"));
+
+        let mut restored = restored;
+        restored
+            .delete_workspace()
+            .await
+            .expect("delete should succeed");
+        assert!(!persisted_root.exists());
+
+        let _ = fs::remove_dir_all(cwd);
     }
 }

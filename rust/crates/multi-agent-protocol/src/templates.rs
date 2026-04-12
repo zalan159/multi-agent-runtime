@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityPolicy, ClaimMode, ClaimPolicy, MultiAgentProvider, PermissionMode, RoleAgentSpec,
-    RoleSpec, SettingSource, WorkspaceSpec, WorkspaceVisibility,
+    ActivityPolicy, ClaimMode, ClaimPolicy, CompletionPolicy, CompletionStatus, MultiAgentProvider,
+    PermissionMode, RoleAgentSpec, RoleSpec, SettingSource, WorkflowArtifactKind,
+    WorkflowArtifactSpec, WorkflowEdgeCondition, WorkflowEdgeSpec, WorkflowMode, WorkflowNodeSpec,
+    WorkflowNodeType, WorkflowSpec, WorkflowStageSpec, WorkflowVotePolicy, WorkspaceSpec,
+    WorkspaceVisibility,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,6 +69,14 @@ pub struct WorkspaceTemplate {
     pub claim_policy: Option<ClaimPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_policy: Option<ActivityPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_vote_policy: Option<WorkflowVotePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<WorkflowArtifactSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_policy: Option<CompletionPolicy>,
     pub roles: Vec<TemplateRoleSpec>,
 }
 
@@ -156,6 +167,55 @@ pub fn instantiate_workspace(
         coordinator_role_id: template.coordinator_role_id.clone(),
         claim_policy: template.claim_policy.clone(),
         activity_policy: template.activity_policy.clone(),
+        workflow_vote_policy: template.workflow_vote_policy.clone(),
+        workflow: template.workflow.clone(),
+        artifacts: template.artifacts.clone(),
+        completion_policy: template.completion_policy.clone(),
+    }
+}
+
+fn node(id: &str, node_type: WorkflowNodeType) -> WorkflowNodeSpec {
+    WorkflowNodeSpec {
+        id: id.to_string(),
+        node_type,
+        title: None,
+        role_id: None,
+        reviewer_role_id: None,
+        candidate_role_ids: None,
+        command: None,
+        evaluator: None,
+        prompt: None,
+        timeout_ms: None,
+        retry: None,
+        requires_artifacts: None,
+        produces_artifacts: None,
+        visibility: None,
+        stage_id: None,
+    }
+}
+
+fn edge(from: &str, to: &str, when: WorkflowEdgeCondition) -> WorkflowEdgeSpec {
+    WorkflowEdgeSpec {
+        from: from.to_string(),
+        to: to.to_string(),
+        when,
+    }
+}
+
+fn artifact(
+    id: &str,
+    kind: WorkflowArtifactKind,
+    path: &str,
+    owner_role_id: Option<&str>,
+    description: &str,
+) -> WorkflowArtifactSpec {
+    WorkflowArtifactSpec {
+        id: id.to_string(),
+        kind,
+        path: path.to_string(),
+        owner_role_id: owner_role_id.map(str::to_string),
+        required: Some(true),
+        description: Some(description.to_string()),
     }
 }
 
@@ -227,7 +287,7 @@ pub fn create_coding_studio_template() -> WorkspaceTemplate {
         ),
         claim_policy: Some(ClaimPolicy {
             mode: ClaimMode::Claim,
-            claim_timeout_ms: Some(1500),
+            claim_timeout_ms: Some(30000),
             max_assignees: Some(1),
             allow_supporting_claims: Some(true),
             fallback_role_id: Some("pm".to_string()),
@@ -238,6 +298,114 @@ pub fn create_coding_studio_template() -> WorkspaceTemplate {
             publish_dispatch_lifecycle: Some(true),
             publish_member_messages: Some(true),
             default_visibility: Some(WorkspaceVisibility::Public),
+        }),
+        workflow_vote_policy: Some(WorkflowVotePolicy {
+            timeout_ms: Some(30_000),
+            minimum_approvals: Some(1),
+            required_approval_ratio: Some(1),
+            candidate_role_ids: None,
+        }),
+        workflow: Some(WorkflowSpec {
+            mode: WorkflowMode::ReviewLoop,
+            entry_node_id: "claim_scope".to_string(),
+            stages: Some(vec![
+                WorkflowStageSpec {
+                    id: "scope".to_string(),
+                    name: "Scope".to_string(),
+                    description: Some("Claim the request, draft the PRD, and get it accepted.".to_string()),
+                    entry_node_id: Some("claim_scope".to_string()),
+                    exit_node_ids: Some(vec!["review_prd".to_string()]),
+                },
+                WorkflowStageSpec {
+                    id: "delivery".to_string(),
+                    name: "Delivery".to_string(),
+                    description: Some("Design, implement, test, and review the change.".to_string()),
+                    entry_node_id: Some("architecture".to_string()),
+                    exit_node_ids: Some(vec!["release_review".to_string(), "complete".to_string()]),
+                },
+            ]),
+            nodes: vec![
+                WorkflowNodeSpec {
+                    candidate_role_ids: Some(vec!["pm".to_string(), "prd".to_string()]),
+                    title: Some("Broadcast request and collect claim".to_string()),
+                    stage_id: Some("scope".to_string()),
+                    ..node("claim_scope", WorkflowNodeType::Claim)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("prd".to_string()),
+                    title: Some("Draft PRD".to_string()),
+                    produces_artifacts: Some(vec!["prd_doc".to_string()]),
+                    stage_id: Some("scope".to_string()),
+                    ..node("draft_prd", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("reviewer".to_string()),
+                    title: Some("Review PRD".to_string()),
+                    requires_artifacts: Some(vec!["prd_doc".to_string()]),
+                    stage_id: Some("scope".to_string()),
+                    ..node("review_prd", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("architect".to_string()),
+                    title: Some("Create architecture plan".to_string()),
+                    requires_artifacts: Some(vec!["prd_doc".to_string()]),
+                    produces_artifacts: Some(vec!["arch_doc".to_string()]),
+                    stage_id: Some("delivery".to_string()),
+                    ..node("architecture", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("coder".to_string()),
+                    title: Some("Implement change".to_string()),
+                    requires_artifacts: Some(vec!["prd_doc".to_string(), "arch_doc".to_string()]),
+                    produces_artifacts: Some(vec!["code_change".to_string()]),
+                    stage_id: Some("delivery".to_string()),
+                    ..node("implement", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("tester".to_string()),
+                    title: Some("Run validation".to_string()),
+                    requires_artifacts: Some(vec!["code_change".to_string()]),
+                    produces_artifacts: Some(vec!["test_report".to_string()]),
+                    stage_id: Some("delivery".to_string()),
+                    ..node("test", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("reviewer".to_string()),
+                    title: Some("Final release review".to_string()),
+                    requires_artifacts: Some(vec!["prd_doc".to_string(), "arch_doc".to_string(), "test_report".to_string()]),
+                    stage_id: Some("delivery".to_string()),
+                    ..node("release_review", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Finish delivery".to_string()),
+                    stage_id: Some("delivery".to_string()),
+                    ..node("complete", WorkflowNodeType::Complete)
+                },
+            ],
+            edges: vec![
+                edge("claim_scope", "draft_prd", WorkflowEdgeCondition::Success),
+                edge("draft_prd", "review_prd", WorkflowEdgeCondition::Success),
+                edge("review_prd", "architecture", WorkflowEdgeCondition::Approved),
+                edge("review_prd", "draft_prd", WorkflowEdgeCondition::Rejected),
+                edge("architecture", "implement", WorkflowEdgeCondition::Success),
+                edge("implement", "test", WorkflowEdgeCondition::Success),
+                edge("test", "release_review", WorkflowEdgeCondition::Pass),
+                edge("test", "implement", WorkflowEdgeCondition::Fail),
+                edge("release_review", "complete", WorkflowEdgeCondition::Approved),
+                edge("release_review", "implement", WorkflowEdgeCondition::Rejected),
+            ],
+        }),
+        artifacts: Some(vec![
+            artifact("prd_doc", WorkflowArtifactKind::Doc, "10-prd/", Some("prd"), "Implementation-ready PRD markdown."),
+            artifact("arch_doc", WorkflowArtifactKind::Doc, "30-arch/", Some("architect"), "Architecture and interface notes."),
+            artifact("code_change", WorkflowArtifactKind::Code, "40-code/", Some("coder"), "Code changes required to satisfy the request."),
+            artifact("test_report", WorkflowArtifactKind::Report, "50-test/", Some("tester"), "Verification evidence and residual risks."),
+        ]),
+        completion_policy: Some(CompletionPolicy {
+            success_node_ids: Some(vec!["complete".to_string()]),
+            failure_node_ids: Some(vec![]),
+            max_iterations: Some(8),
+            default_status: Some(CompletionStatus::Stuck),
         }),
         roles: vec![
             TemplateRoleSpec {
@@ -392,6 +560,115 @@ pub fn create_opc_solo_company_template() -> WorkspaceTemplate {
             publish_member_messages: Some(true),
             default_visibility: Some(WorkspaceVisibility::Public),
         }),
+        workflow_vote_policy: Some(WorkflowVotePolicy {
+            timeout_ms: Some(30_000),
+            minimum_approvals: Some(1),
+            required_approval_ratio: Some(1),
+            candidate_role_ids: None,
+        }),
+        workflow: Some(WorkflowSpec {
+            mode: WorkflowMode::Pipeline,
+            entry_node_id: "intake".to_string(),
+            stages: Some(vec![
+                WorkflowStageSpec {
+                    id: "intake".to_string(),
+                    name: "Intake".to_string(),
+                    description: Some("CEO frames the request and routes it to the right operator.".to_string()),
+                    entry_node_id: Some("intake".to_string()),
+                    exit_node_ids: Some(vec!["route_specialist".to_string()]),
+                },
+                WorkflowStageSpec {
+                    id: "operations".to_string(),
+                    name: "Operations".to_string(),
+                    description: Some("Specialist operators prepare concrete operating artifacts.".to_string()),
+                    entry_node_id: Some("route_specialist".to_string()),
+                    exit_node_ids: Some(vec!["ceo_review".to_string(), "complete".to_string()]),
+                },
+            ]),
+            nodes: vec![
+                WorkflowNodeSpec {
+                    role_id: Some("ceo".to_string()),
+                    title: Some("Frame request and operating goal".to_string()),
+                    stage_id: Some("intake".to_string()),
+                    ..node("intake", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Route to specialist".to_string()),
+                    candidate_role_ids: Some(vec![
+                        "finance".to_string(),
+                        "tax".to_string(),
+                        "admin".to_string(),
+                        "recruiter".to_string(),
+                    ]),
+                    stage_id: Some("operations".to_string()),
+                    ..node("route_specialist", WorkflowNodeType::Claim)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("finance".to_string()),
+                    title: Some("Prepare finance deliverable".to_string()),
+                    produces_artifacts: Some(vec!["finance_doc".to_string()]),
+                    stage_id: Some("operations".to_string()),
+                    ..node("finance_work", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("tax".to_string()),
+                    title: Some("Prepare tax deliverable".to_string()),
+                    produces_artifacts: Some(vec!["tax_doc".to_string()]),
+                    stage_id: Some("operations".to_string()),
+                    ..node("tax_work", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("admin".to_string()),
+                    title: Some("Prepare admin deliverable".to_string()),
+                    produces_artifacts: Some(vec!["admin_doc".to_string()]),
+                    stage_id: Some("operations".to_string()),
+                    ..node("admin_work", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("recruiter".to_string()),
+                    title: Some("Prepare recruiting deliverable".to_string()),
+                    produces_artifacts: Some(vec!["recruit_doc".to_string()]),
+                    stage_id: Some("operations".to_string()),
+                    ..node("recruit_work", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("ceo".to_string()),
+                    title: Some("CEO review and approve".to_string()),
+                    stage_id: Some("operations".to_string()),
+                    ..node("ceo_review", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Finish operating workflow".to_string()),
+                    stage_id: Some("operations".to_string()),
+                    ..node("complete", WorkflowNodeType::Complete)
+                },
+            ],
+            edges: vec![
+                edge("intake", "route_specialist", WorkflowEdgeCondition::Success),
+                edge("route_specialist", "finance_work", WorkflowEdgeCondition::Success),
+                edge("route_specialist", "tax_work", WorkflowEdgeCondition::Success),
+                edge("route_specialist", "admin_work", WorkflowEdgeCondition::Success),
+                edge("route_specialist", "recruit_work", WorkflowEdgeCondition::Success),
+                edge("finance_work", "ceo_review", WorkflowEdgeCondition::Success),
+                edge("tax_work", "ceo_review", WorkflowEdgeCondition::Success),
+                edge("admin_work", "ceo_review", WorkflowEdgeCondition::Success),
+                edge("recruit_work", "ceo_review", WorkflowEdgeCondition::Success),
+                edge("ceo_review", "complete", WorkflowEdgeCondition::Approved),
+                edge("ceo_review", "route_specialist", WorkflowEdgeCondition::Rejected),
+            ],
+        }),
+        artifacts: Some(vec![
+            artifact("finance_doc", WorkflowArtifactKind::Report, "company/10-finance/", Some("finance"), "Finance checklist, budget, or operating summary."),
+            artifact("tax_doc", WorkflowArtifactKind::Report, "company/20-tax/", Some("tax"), "Tax filing checklist or compliance note."),
+            artifact("admin_doc", WorkflowArtifactKind::Doc, "company/30-admin/", Some("admin"), "Administrative SOP or operator checklist."),
+            artifact("recruit_doc", WorkflowArtifactKind::Doc, "company/40-recruiting/", Some("recruiter"), "Hiring brief, scorecard, or interview plan."),
+        ]),
+        completion_policy: Some(CompletionPolicy {
+            success_node_ids: Some(vec!["complete".to_string()]),
+            failure_node_ids: Some(vec![]),
+            max_iterations: Some(4),
+            default_status: Some(CompletionStatus::Stuck),
+        }),
         roles: vec![
             role_with_capabilities(
                 "ceo",
@@ -479,7 +756,7 @@ pub fn create_autoresearch_template() -> WorkspaceTemplate {
         ),
         claim_policy: Some(ClaimPolicy {
             mode: ClaimMode::Claim,
-            claim_timeout_ms: Some(1000),
+            claim_timeout_ms: Some(30000),
             max_assignees: Some(2),
             allow_supporting_claims: Some(true),
             fallback_role_id: Some("lead".to_string()),
@@ -490,6 +767,122 @@ pub fn create_autoresearch_template() -> WorkspaceTemplate {
             publish_dispatch_lifecycle: Some(true),
             publish_member_messages: Some(true),
             default_visibility: Some(WorkspaceVisibility::Public),
+        }),
+        workflow_vote_policy: Some(WorkflowVotePolicy {
+            timeout_ms: Some(30_000),
+            minimum_approvals: Some(1),
+            required_approval_ratio: Some(1),
+            candidate_role_ids: None,
+        }),
+        workflow: Some(WorkflowSpec {
+            mode: WorkflowMode::Loop,
+            entry_node_id: "frame_hypothesis".to_string(),
+            stages: Some(vec![
+                WorkflowStageSpec {
+                    id: "research".to_string(),
+                    name: "Research".to_string(),
+                    description: Some("Frame hypothesis, gather evidence, and design the next experiment.".to_string()),
+                    entry_node_id: Some("frame_hypothesis".to_string()),
+                    exit_node_ids: Some(vec!["decide_outcome".to_string()]),
+                },
+                WorkflowStageSpec {
+                    id: "iteration".to_string(),
+                    name: "Iteration".to_string(),
+                    description: Some("Keep improvements, discard regressions, and loop.".to_string()),
+                    entry_node_id: Some("decide_outcome".to_string()),
+                    exit_node_ids: Some(vec!["loop_next".to_string(), "discard".to_string()]),
+                },
+            ]),
+            nodes: vec![
+                WorkflowNodeSpec {
+                    role_id: Some("lead".to_string()),
+                    title: Some("Frame the current hypothesis".to_string()),
+                    produces_artifacts: Some(vec!["research_brief".to_string()]),
+                    stage_id: Some("research".to_string()),
+                    ..node("frame_hypothesis", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    candidate_role_ids: Some(vec!["scout".to_string(), "critic".to_string()]),
+                    title: Some("Claim evidence gathering".to_string()),
+                    stage_id: Some("research".to_string()),
+                    ..node("claim_evidence", WorkflowNodeType::Claim)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("scout".to_string()),
+                    title: Some("Collect evidence".to_string()),
+                    requires_artifacts: Some(vec!["research_brief".to_string()]),
+                    produces_artifacts: Some(vec!["evidence_pack".to_string()]),
+                    stage_id: Some("research".to_string()),
+                    ..node("collect_evidence", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("experimenter".to_string()),
+                    title: Some("Run experiment".to_string()),
+                    command: Some("uv run train.py > run.log 2>&1".to_string()),
+                    timeout_ms: Some(600000),
+                    requires_artifacts: Some(vec!["evidence_pack".to_string()]),
+                    produces_artifacts: Some(vec!["run_log".to_string()]),
+                    stage_id: Some("research".to_string()),
+                    ..node("run_experiment", WorkflowNodeType::Shell)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Evaluate experiment metrics".to_string()),
+                    evaluator: Some("parse_autoresearch_run_log".to_string()),
+                    requires_artifacts: Some(vec!["run_log".to_string()]),
+                    produces_artifacts: Some(vec!["experiment_result".to_string()]),
+                    stage_id: Some("research".to_string()),
+                    ..node("evaluate_results", WorkflowNodeType::Evaluate)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("lead".to_string()),
+                    title: Some("Decide keep or discard".to_string()),
+                    requires_artifacts: Some(vec!["experiment_result".to_string()]),
+                    stage_id: Some("iteration".to_string()),
+                    ..node("decide_outcome", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Keep winning experiment".to_string()),
+                    stage_id: Some("iteration".to_string()),
+                    ..node("keep", WorkflowNodeType::Commit)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Discard regression".to_string()),
+                    stage_id: Some("iteration".to_string()),
+                    ..node("discard", WorkflowNodeType::Revert)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Advance to next iteration".to_string()),
+                    retry: Some(crate::WorkflowRetryPolicy { max_attempts: Some(100) }),
+                    stage_id: Some("iteration".to_string()),
+                    ..node("loop_next", WorkflowNodeType::Loop)
+                },
+            ],
+            edges: vec![
+                edge("frame_hypothesis", "claim_evidence", WorkflowEdgeCondition::Success),
+                edge("claim_evidence", "collect_evidence", WorkflowEdgeCondition::Success),
+                edge("collect_evidence", "run_experiment", WorkflowEdgeCondition::Success),
+                edge("run_experiment", "evaluate_results", WorkflowEdgeCondition::Success),
+                edge("run_experiment", "discard", WorkflowEdgeCondition::Failure),
+                edge("run_experiment", "discard", WorkflowEdgeCondition::Timeout),
+                edge("evaluate_results", "keep", WorkflowEdgeCondition::Improved),
+                edge("evaluate_results", "discard", WorkflowEdgeCondition::EqualOrWorse),
+                edge("evaluate_results", "discard", WorkflowEdgeCondition::Crash),
+                edge("keep", "loop_next", WorkflowEdgeCondition::Success),
+                edge("discard", "loop_next", WorkflowEdgeCondition::Success),
+                edge("loop_next", "frame_hypothesis", WorkflowEdgeCondition::Retry),
+            ],
+        }),
+        artifacts: Some(vec![
+            artifact("research_brief", WorkflowArtifactKind::Doc, "research/00-lead/", Some("lead"), "Current hypothesis and success criteria."),
+            artifact("evidence_pack", WorkflowArtifactKind::Evidence, "research/10-scout/", Some("scout"), "Evidence pack with cited sources and observations."),
+            artifact("run_log", WorkflowArtifactKind::Result, "run.log", Some("experimenter"), "Raw experiment log from the latest run."),
+            artifact("experiment_result", WorkflowArtifactKind::Metric, "results.tsv", Some("lead"), "Parsed outcome used to decide keep or discard."),
+        ]),
+        completion_policy: Some(CompletionPolicy {
+            success_node_ids: Some(vec!["keep".to_string()]),
+            failure_node_ids: Some(vec!["discard".to_string()]),
+            max_iterations: Some(100),
+            default_status: Some(CompletionStatus::Done),
         }),
         roles: vec![
             role_with_capabilities(
@@ -570,7 +963,7 @@ pub fn create_edict_governance_template() -> WorkspaceTemplate {
         ),
         claim_policy: Some(ClaimPolicy {
             mode: ClaimMode::Claim,
-            claim_timeout_ms: Some(1500),
+            claim_timeout_ms: Some(30000),
             max_assignees: Some(2),
             allow_supporting_claims: Some(true),
             fallback_role_id: Some("shangshu".to_string()),
@@ -581,6 +974,151 @@ pub fn create_edict_governance_template() -> WorkspaceTemplate {
             publish_dispatch_lifecycle: Some(true),
             publish_member_messages: Some(true),
             default_visibility: Some(WorkspaceVisibility::Public),
+        }),
+        workflow_vote_policy: Some(WorkflowVotePolicy {
+            timeout_ms: Some(30_000),
+            minimum_approvals: Some(1),
+            required_approval_ratio: Some(1),
+            candidate_role_ids: None,
+        }),
+        workflow: Some(WorkflowSpec {
+            mode: WorkflowMode::ReviewLoop,
+            entry_node_id: "draft_order".to_string(),
+            stages: Some(vec![
+                WorkflowStageSpec {
+                    id: "draft".to_string(),
+                    name: "Draft".to_string(),
+                    description: Some("Draft task order and clear initial review.".to_string()),
+                    entry_node_id: Some("draft_order".to_string()),
+                    exit_node_ids: Some(vec!["review_order".to_string()]),
+                },
+                WorkflowStageSpec {
+                    id: "execution".to_string(),
+                    name: "Execution".to_string(),
+                    description: Some("Dispatch ministries, gather outputs, and clear oversight.".to_string()),
+                    entry_node_id: Some("coordinate_execution".to_string()),
+                    exit_node_ids: Some(vec!["final_review".to_string(), "complete".to_string()]),
+                },
+            ]),
+            nodes: vec![
+                WorkflowNodeSpec {
+                    role_id: Some("zhongshu".to_string()),
+                    title: Some("Draft task order".to_string()),
+                    produces_artifacts: Some(vec!["task_order".to_string()]),
+                    stage_id: Some("draft".to_string()),
+                    ..node("draft_order", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("menxia".to_string()),
+                    title: Some("Review task order".to_string()),
+                    requires_artifacts: Some(vec!["task_order".to_string()]),
+                    stage_id: Some("draft".to_string()),
+                    ..node("review_order", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("shangshu".to_string()),
+                    title: Some("Coordinate ministry execution".to_string()),
+                    requires_artifacts: Some(vec!["task_order".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("coordinate_execution", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    candidate_role_ids: Some(vec![
+                        "gongbu".to_string(),
+                        "hubu".to_string(),
+                        "libu".to_string(),
+                        "xingbu".to_string(),
+                        "bingbu".to_string(),
+                    ]),
+                    title: Some("Claim specialist ministry work".to_string()),
+                    stage_id: Some("execution".to_string()),
+                    ..node("claim_ministry", WorkflowNodeType::Claim)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("gongbu".to_string()),
+                    title: Some("Execute implementation work".to_string()),
+                    produces_artifacts: Some(vec!["implementation_output".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("implement_work", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("hubu".to_string()),
+                    title: Some("Assess resources and constraints".to_string()),
+                    produces_artifacts: Some(vec!["resource_report".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("resource_review", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("xingbu".to_string()),
+                    title: Some("Perform compliance review".to_string()),
+                    requires_artifacts: Some(vec!["implementation_output".to_string(), "resource_report".to_string()]),
+                    produces_artifacts: Some(vec!["compliance_report".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("compliance_review", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("bingbu".to_string()),
+                    title: Some("Assess operational readiness".to_string()),
+                    produces_artifacts: Some(vec!["ops_plan".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("ops_readiness", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    role_id: Some("libu".to_string()),
+                    title: Some("Package communication artifact".to_string()),
+                    produces_artifacts: Some(vec!["communication_brief".to_string()]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("communication", WorkflowNodeType::Assign)
+                },
+                WorkflowNodeSpec {
+                    reviewer_role_id: Some("menxia".to_string()),
+                    title: Some("Final review".to_string()),
+                    requires_artifacts: Some(vec![
+                        "task_order".to_string(),
+                        "implementation_output".to_string(),
+                        "resource_report".to_string(),
+                        "compliance_report".to_string(),
+                        "ops_plan".to_string(),
+                    ]),
+                    stage_id: Some("execution".to_string()),
+                    ..node("final_review", WorkflowNodeType::Review)
+                },
+                WorkflowNodeSpec {
+                    title: Some("Close governance workflow".to_string()),
+                    stage_id: Some("execution".to_string()),
+                    ..node("complete", WorkflowNodeType::Complete)
+                },
+            ],
+            edges: vec![
+                edge("draft_order", "review_order", WorkflowEdgeCondition::Success),
+                edge("review_order", "coordinate_execution", WorkflowEdgeCondition::Approved),
+                edge("review_order", "draft_order", WorkflowEdgeCondition::Rejected),
+                edge("coordinate_execution", "claim_ministry", WorkflowEdgeCondition::Success),
+                edge("claim_ministry", "implement_work", WorkflowEdgeCondition::Success),
+                edge("claim_ministry", "resource_review", WorkflowEdgeCondition::Success),
+                edge("implement_work", "compliance_review", WorkflowEdgeCondition::Success),
+                edge("resource_review", "compliance_review", WorkflowEdgeCondition::Success),
+                edge("compliance_review", "ops_readiness", WorkflowEdgeCondition::Approved),
+                edge("compliance_review", "implement_work", WorkflowEdgeCondition::Rejected),
+                edge("ops_readiness", "communication", WorkflowEdgeCondition::Success),
+                edge("communication", "final_review", WorkflowEdgeCondition::Success),
+                edge("final_review", "complete", WorkflowEdgeCondition::Approved),
+                edge("final_review", "coordinate_execution", WorkflowEdgeCondition::Rejected),
+            ],
+        }),
+        artifacts: Some(vec![
+            artifact("task_order", WorkflowArtifactKind::TaskOrder, "governance/10-zhongshu/", Some("zhongshu"), "Mission brief and task order."),
+            artifact("implementation_output", WorkflowArtifactKind::Result, "governance/30-gongbu/", Some("gongbu"), "Concrete implementation output."),
+            artifact("resource_report", WorkflowArtifactKind::Report, "governance/40-hubu/", Some("hubu"), "Resource and tradeoff report."),
+            artifact("compliance_report", WorkflowArtifactKind::Report, "governance/60-xingbu/", Some("xingbu"), "Compliance and quality review."),
+            artifact("ops_plan", WorkflowArtifactKind::Doc, "governance/70-bingbu/", Some("bingbu"), "Operational rollout and fallback plan."),
+            artifact("communication_brief", WorkflowArtifactKind::Doc, "governance/50-libu/", Some("libu"), "External or internal communication brief."),
+        ]),
+        completion_policy: Some(CompletionPolicy {
+            success_node_ids: Some(vec!["complete".to_string()]),
+            failure_node_ids: Some(vec![]),
+            max_iterations: Some(6),
+            default_status: Some(CompletionStatus::Stuck),
         }),
         roles: vec![
             role_with_capabilities(
@@ -755,6 +1293,19 @@ mod tests {
         assert_eq!(spec.model, "claude-sonnet-4-5");
         assert_eq!(spec.default_role_id.as_deref(), Some("pm"));
         assert_eq!(spec.setting_sources, Some(vec![SettingSource::Project]));
+        assert_eq!(spec.workflow.as_ref().unwrap().mode, WorkflowMode::ReviewLoop);
+        assert!(spec
+            .artifacts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact.id == "prd_doc"));
+        assert_eq!(
+            spec.completion_policy
+                .as_ref()
+                .and_then(|policy| policy.default_status),
+            Some(CompletionStatus::Stuck)
+        );
 
         let coder = spec.roles.iter().find(|role| role.id == "coder").unwrap();
         assert_eq!(
@@ -787,5 +1338,6 @@ mod tests {
         assert_eq!(spec.model, "gpt-5.1-codex-mini");
         assert!(spec.allowed_tools.as_ref().unwrap().contains(&"WebSearch".to_string()));
         assert!(spec.allowed_tools.as_ref().unwrap().contains(&"WebFetch".to_string()));
+        assert_eq!(spec.workflow.as_ref().unwrap().mode, WorkflowMode::Loop);
     }
 }

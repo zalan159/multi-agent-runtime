@@ -13,36 +13,64 @@ import {
 
 import type {
   ActivityPublishedEvent,
+  ClaimResponseEvent,
+  ClaimWindowClosedEvent,
+  ClaimWindowOpenedEvent,
   DispatchClaimedEvent,
   DispatchCompletedEvent,
   DispatchProgressEvent,
   DispatchResultEvent,
   ToolProgressEvent,
+  WorkflowStartedEvent,
+  WorkflowVoteResponseEvent,
+  WorkflowVoteWindowClosedEvent,
+  WorkflowVoteWindowOpenedEvent,
   WorkspaceInitializedEvent,
   WorkspaceMessageEvent,
   WorkspaceStateChangedEvent,
   MemberRegisteredEvent,
   MemberStateChangedEvent,
+  WorkspaceEvent,
 } from '../../core/events.js';
+import {
+  type PersistedProviderState,
+  LocalWorkspacePersistence,
+} from '../../core/localPersistence.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
   ClaimStatus,
+  CoordinatorWorkflowDecision,
   RoleSpec,
   RoleTaskRequest,
   TaskDispatch,
   WorkspaceActivity,
   WorkspaceActivityKind,
+  WorkspaceClaimResponse,
+  WorkspaceClaimWindow,
   WorkspaceMember,
   WorkspaceSpec,
   WorkspaceState,
   WorkspaceTurnRequest,
   WorkspaceTurnResult,
   WorkspaceVisibility,
+  WorkspaceWorkflowVoteResponse,
+  WorkspaceWorkflowVoteWindow,
 } from '../../core/types.js';
 import {
+  buildWorkflowEntryPlan,
+  buildPlanFromClaimResponses,
+  buildCoordinatorDecisionPrompt,
+  buildWorkflowVotePrompt,
+  buildWorkspaceClaimPrompt,
   buildWorkspaceTurnPrompt,
   planWorkspaceTurnHeuristically,
+  parseCoordinatorDecision,
+  parseWorkspaceClaimResponse,
+  parseWorkflowVoteResponse,
   parseWorkspaceTurnPlan,
+  resolveClaimCandidateRoleIds,
+  resolveWorkflowVoteCandidateRoleIds,
+  shouldApproveWorkflowVote,
 } from '../../core/workspaceTurn.js';
 
 export interface CodexSdkWorkspaceOptions {
@@ -78,6 +106,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
 
   private readonly state: WorkspaceState;
   private readonly roleThreads = new Map<string, Thread>();
+  private readonly roleThreadIds = new Map<string, string>();
   private readonly roleChains = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<
     string,
@@ -91,6 +120,9 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
   private active = false;
   private initialized = false;
   private initializedWithThread = false;
+  private readonly persistence: LocalWorkspacePersistence | undefined;
+  private persistenceFlushed = Promise.resolve();
+  private restoredFromPersistence = false;
 
   constructor(options: CodexSdkWorkspaceOptions) {
     super();
@@ -104,6 +136,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     this.webSearchMode = options.webSearchMode;
     this.additionalDirectories = options.additionalDirectories;
     this.debug = options.debug ?? false;
+    this.persistence = LocalWorkspacePersistence.fromSpec(this.spec);
     this.client = new Codex({
       ...(options.codexPathOverride
         ? { codexPathOverride: options.codexPathOverride }
@@ -134,7 +167,34 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
         ]),
       ),
       activities: [],
+      workflowRuntime: {
+        mode: 'group_chat',
+      },
     };
+  }
+
+  static async restoreFromLocal(
+    options: Omit<CodexSdkWorkspaceOptions, 'spec'> & {
+      cwd: string;
+      workspaceId: string;
+    },
+  ): Promise<CodexSdkWorkspace> {
+    const persistence = LocalWorkspacePersistence.fromWorkspace(
+      options.cwd,
+      options.workspaceId,
+    );
+    const [spec, state, providerState] = await Promise.all([
+      persistence.loadWorkspaceSpec(),
+      persistence.loadWorkspaceState(),
+      persistence.loadProviderState(),
+    ]);
+    const workspace = new CodexSdkWorkspace({
+      ...options,
+      spec,
+    });
+    workspace.applyPersistedState(state, providerState);
+    workspace.restoredFromPersistence = true;
+    return workspace;
   }
 
   getSnapshot(): WorkspaceState {
@@ -147,10 +207,16 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     };
   }
 
+  getPersistenceRoot(): string | undefined {
+    return this.persistence?.root;
+  }
+
   async start(): Promise<void> {
     if (this.active) {
       return;
     }
+
+    await this.ensurePersistenceInitialized();
 
     this.active = true;
     this.state.status = 'running';
@@ -271,29 +337,103 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
   ): Promise<WorkspaceTurnResult> {
     const coordinatorRole = this.resolveCoordinatorRole();
     await this.send(request.message, request.visibility ?? 'public');
+    const coordinatorDecision = await this.requestCoordinatorDecision(request, options.timeoutMs);
+    this.emitCoordinatorSummary(coordinatorDecision.responseText, coordinatorRole.id);
 
-    const coordinatorDispatch = this.spec.claimPolicy?.mode === 'claim'
-      ? undefined
-      : await this.runRoleTask(
-          {
-            roleId: coordinatorRole.id,
-            summary: `Coordinate workspace turn for: ${request.message}`,
-            instruction: buildWorkspaceTurnPrompt(this.spec, request),
-            visibility: 'coordinator',
-            sourceRoleId: coordinatorRole.id,
-          },
-          options,
-        );
+    if (coordinatorDecision.kind === 'respond') {
+      return {
+        request,
+        plan: {
+          coordinatorRoleId: coordinatorRole.id,
+          responseText: coordinatorDecision.responseText,
+          assignments: [],
+          ...(coordinatorDecision.rationale ? { rationale: coordinatorDecision.rationale } : {}),
+        },
+        dispatches: [],
+      };
+    }
 
-    const plan = coordinatorDispatch
-      ? parseWorkspaceTurnPlan(
-          coordinatorDispatch.resultText ?? coordinatorDispatch.lastSummary ?? '',
-          this.spec,
+    let workflowVoteWindow: WorkspaceWorkflowVoteWindow | undefined;
+    let workflowVoteResponses: WorkspaceWorkflowVoteResponse[] | undefined;
+    let shouldRunWorkflow = false;
+    if (coordinatorDecision.kind === 'propose_workflow') {
+      workflowVoteWindow = this.openWorkflowVoteWindow(
+        request,
+        coordinatorDecision,
+        resolveWorkflowVoteCandidateRoleIds(this.spec, request, coordinatorDecision),
+      );
+      workflowVoteResponses = await this.collectWorkflowVoteResponses(
+        workflowVoteWindow,
+        request,
+        coordinatorDecision,
+        options.timeoutMs,
+      );
+      shouldRunWorkflow = shouldApproveWorkflowVote(this.spec, workflowVoteResponses);
+      this.closeWorkflowVoteWindow(
+        workflowVoteWindow,
+        coordinatorDecision,
+        workflowVoteResponses,
+        shouldRunWorkflow,
+      );
+      if (!shouldRunWorkflow) {
+        return {
           request,
-        )
-      : planWorkspaceTurnHeuristically(this.spec, request);
+          workflowVoteWindow,
+          workflowVoteResponses,
+          plan: {
+            coordinatorRoleId: coordinatorRole.id,
+            responseText: coordinatorDecision.responseText,
+            assignments: [],
+            rationale: 'Workflow vote rejected; staying in group chat mode.',
+          },
+          dispatches: [],
+        };
+      }
+      this.emitWorkflowStarted(coordinatorDecision, workflowVoteWindow);
+    }
 
-    this.emitCoordinatorSummary(plan.responseText, coordinatorRole.id);
+    const effectiveRequest =
+      coordinatorDecision.kind === 'delegate' && coordinatorDecision.targetRoleId
+        ? { ...request, preferRoleId: coordinatorDecision.targetRoleId }
+        : request;
+
+    const claimCandidateRoleIds =
+      !shouldRunWorkflow && this.spec.claimPolicy?.mode === 'claim'
+        ? resolveClaimCandidateRoleIds(this.spec, effectiveRequest)
+        : undefined;
+    const claimWindow =
+      !shouldRunWorkflow && this.spec.claimPolicy?.mode === 'claim'
+        ? this.openClaimWindow(effectiveRequest, claimCandidateRoleIds ?? this.spec.roles.map(role => role.id))
+        : undefined;
+
+    const claimResponses = claimWindow
+      ? await this.collectClaimResponses(claimWindow, effectiveRequest, options.timeoutMs)
+      : undefined;
+
+    const plan = claimResponses
+      ? buildPlanFromClaimResponses(this.spec, effectiveRequest, claimResponses)
+      : shouldRunWorkflow
+        ? buildWorkflowEntryPlan(this.spec, effectiveRequest)
+        : coordinatorDecision.kind === 'delegate' && coordinatorDecision.targetRoleId
+          ? {
+              coordinatorRoleId: coordinatorRole.id,
+              responseText: coordinatorDecision.responseText,
+              assignments: planWorkspaceTurnHeuristically(this.spec, effectiveRequest).assignments,
+              ...(coordinatorDecision.rationale ? { rationale: coordinatorDecision.rationale } : {}),
+            }
+          : {
+              coordinatorRoleId: coordinatorRole.id,
+              responseText: coordinatorDecision.responseText,
+              assignments: planWorkspaceTurnHeuristically(this.spec, effectiveRequest).assignments,
+              ...(coordinatorDecision.rationale ? { rationale: coordinatorDecision.rationale } : {}),
+            };
+    if (claimWindow) {
+      this.closeClaimWindow(
+        claimWindow,
+        claimResponses ?? [],
+        plan.assignments.map(assignment => assignment.roleId),
+      );
+    }
 
     const dispatches: TaskDispatch[] = [];
     for (const assignment of plan.assignments) {
@@ -304,7 +444,13 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
         visibility: assignment.visibility ?? request.visibility ?? 'public',
         sourceRoleId: coordinatorRole.id,
       });
-      this.claimDispatch(dispatch.dispatchId, assignment.roleId, 'Claimed by coordinator routing');
+      const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
+      this.claimDispatch(
+        dispatch.dispatchId,
+        assignment.roleId,
+        claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
+        claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
+      );
       dispatches.push(
         await this.runDispatch(Promise.resolve(dispatch), options),
       );
@@ -312,10 +458,29 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
 
     return {
       request,
-      ...(coordinatorDispatch ? { coordinatorDispatch } : {}),
+      ...(claimWindow ? { claimWindow } : {}),
+      ...(claimResponses ? { claimResponses } : {}),
+      ...(workflowVoteWindow ? { workflowVoteWindow } : {}),
+      ...(workflowVoteResponses ? { workflowVoteResponses } : {}),
       plan,
       dispatches,
     };
+  }
+
+  async deleteWorkspace(): Promise<void> {
+    for (const run of this.activeRuns.values()) {
+      run.controller.abort();
+    }
+    this.activeRuns.clear();
+    await this.persistenceFlushed;
+    if (this.persistence) {
+      await this.persistence.deleteWorkspace();
+    }
+  }
+
+  protected override emitEvent(event: WorkspaceEvent): void {
+    super.emitEvent(event);
+    this.schedulePersistence([event]);
   }
 
   async stopTask(taskId: string): Promise<void> {
@@ -359,6 +524,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
 
       for await (const event of events) {
         if (event.type === 'thread.started') {
+          this.roleThreadIds.set(role.id, event.thread_id);
           this.roleThreads.set(role.id, thread);
           this.activeRuns.get(dispatch.dispatchId)!.threadId = event.thread_id;
           this.state.sessionId = event.thread_id;
@@ -458,6 +624,9 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     } catch (error) {
       if (!completed) {
         const threadId = thread.id ?? dispatch.dispatchId;
+        if (thread.id) {
+          this.roleThreadIds.set(role.id, thread.id);
+        }
         this.finishDispatch(
           dispatch.dispatchId,
           threadId,
@@ -485,7 +654,19 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       return existing;
     }
 
-    const thread = this.client.startThread({
+    const persistedThreadId = this.roleThreadIds.get(role.id);
+    const thread = persistedThreadId
+      ? this.client.resumeThread(persistedThreadId)
+      : this.createThread(role);
+    this.roleThreads.set(role.id, thread);
+    if (thread.id) {
+      this.roleThreadIds.set(role.id, thread.id);
+    }
+    return thread;
+  }
+
+  private createThread(role: RoleSpec): Thread {
+    return this.client.startThread({
       model: role.agent.model ?? this.spec.model,
       ...(this.sandboxMode ? { sandboxMode: this.sandboxMode } : {}),
       ...(this.workingDirectory
@@ -504,8 +685,21 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
         ? { additionalDirectories: this.additionalDirectories }
         : {}),
     });
-    this.roleThreads.set(role.id, thread);
-    return thread;
+  }
+
+  private createClaimProbeThread(role: RoleSpec): Thread {
+    return this.client.startThread({
+      model: role.agent.model ?? this.spec.model,
+      sandboxMode: 'read-only',
+      ...(this.workingDirectory
+        ? { workingDirectory: this.workingDirectory }
+        : {}),
+      skipGitRepoCheck: true,
+      modelReasoningEffort: 'low',
+      networkAccessEnabled: false,
+      webSearchMode: 'disabled',
+      approvalPolicy: 'never',
+    });
   }
 
   private resolveCoordinatorRole(): RoleSpec {
@@ -823,6 +1017,370 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     this.emitEvent(event);
   }
 
+  private openClaimWindow(
+    request: WorkspaceTurnRequest,
+    candidateRoleIds: string[],
+  ): WorkspaceClaimWindow {
+    const claimWindow: WorkspaceClaimWindow = {
+      windowId: randomUUID(),
+      request,
+      candidateRoleIds,
+      ...(this.spec.claimPolicy?.claimTimeoutMs
+        ? { timeoutMs: this.spec.claimPolicy.claimTimeoutMs }
+        : {}),
+    };
+    const event: ClaimWindowOpenedEvent = {
+      type: 'claim.window.opened',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      claimWindow,
+    };
+    this.emitEvent(event);
+    this.publishActivity('claim_window_opened', `Claim window opened for: ${request.message}`, {
+      visibility: 'public',
+    });
+    return claimWindow;
+  }
+
+  private closeClaimWindow(
+    claimWindow: WorkspaceClaimWindow,
+    responses: WorkspaceClaimResponse[],
+    selectedRoleIds: string[],
+  ): void {
+    const event: ClaimWindowClosedEvent = {
+      type: 'claim.window.closed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      claimWindow,
+      responses,
+      selectedRoleIds,
+    };
+    this.emitEvent(event);
+    this.publishActivity(
+      'claim_window_closed',
+      selectedRoleIds.length > 0
+        ? `Claim window resolved: ${selectedRoleIds.map(roleId => `@${roleId}`).join(', ')}`
+        : 'Claim window closed with no claimants.',
+      { visibility: 'public' },
+    );
+  }
+
+  private openWorkflowVoteWindow(
+    request: WorkspaceTurnRequest,
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    candidateRoleIds: string[],
+  ): WorkspaceWorkflowVoteWindow {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      mode: 'workflow_vote',
+    };
+    const voteWindow: WorkspaceWorkflowVoteWindow = {
+      voteId: randomUUID(),
+      request,
+      reason: coordinatorDecision.workflowVoteReason ?? coordinatorDecision.responseText,
+      candidateRoleIds,
+      ...(this.spec.workflowVotePolicy?.timeoutMs
+        ? { timeoutMs: this.spec.workflowVotePolicy.timeoutMs }
+        : {}),
+    };
+    this.state.workflowRuntime.activeVoteWindow = voteWindow;
+    const event: WorkflowVoteWindowOpenedEvent = {
+      type: 'workflow.vote.opened',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      coordinatorDecision,
+      voteWindow,
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_vote_opened', voteWindow.reason, {
+      roleId: this.resolveCoordinatorRole().id,
+      visibility: 'public',
+    });
+    return voteWindow;
+  }
+
+  private closeWorkflowVoteWindow(
+    voteWindow: WorkspaceWorkflowVoteWindow,
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    responses: WorkspaceWorkflowVoteResponse[],
+    approved: boolean,
+  ): void {
+    this.state.workflowRuntime = {
+      mode: approved ? 'workflow_running' : 'group_chat',
+      ...(this.state.workflowRuntime.activeNodeId
+        ? { activeNodeId: this.state.workflowRuntime.activeNodeId }
+        : {}),
+      ...(this.state.workflowRuntime.activeStageId
+        ? { activeStageId: this.state.workflowRuntime.activeStageId }
+        : {}),
+    };
+    const event: WorkflowVoteWindowClosedEvent = {
+      type: 'workflow.vote.closed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      coordinatorDecision,
+      voteWindow,
+      responses,
+      approved,
+    };
+    this.emitEvent(event);
+    this.publishActivity(
+      approved ? 'workflow_vote_approved' : 'workflow_vote_rejected',
+      approved ? 'Workflow vote approved.' : 'Workflow vote rejected.',
+      {
+        roleId: this.resolveCoordinatorRole().id,
+        visibility: 'public',
+      },
+    );
+  }
+
+  private async collectWorkflowVoteResponses(
+    voteWindow: WorkspaceWorkflowVoteWindow,
+    request: WorkspaceTurnRequest,
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    timeoutMs = 120_000,
+  ): Promise<WorkspaceWorkflowVoteResponse[]> {
+    const voteTimeout = Math.max(
+      5_000,
+      Math.min(timeoutMs, this.spec.workflowVotePolicy?.timeoutMs ?? 30_000),
+    );
+
+    return Promise.all(
+      voteWindow.candidateRoleIds.map(async roleId => {
+        const role = this.spec.roles.find(value => value.id === roleId);
+        if (!role) {
+          const response: WorkspaceWorkflowVoteResponse = {
+            roleId,
+            decision: 'abstain',
+            confidence: 0,
+            rationale: `@${roleId} is not available for workflow voting.`,
+            publicResponse: `@${roleId} abstained.`,
+          };
+          this.emitWorkflowVoteResponse(voteWindow, response);
+          return response;
+        }
+        try {
+          const response = await this.probeWorkflowVote(
+            role,
+            request,
+            coordinatorDecision,
+            voteTimeout,
+          );
+          this.emitWorkflowVoteResponse(voteWindow, response);
+          return response;
+        } catch {
+          const response = parseWorkflowVoteResponse(
+            {
+              decision: 'abstain',
+              confidence: 0,
+              rationale: `@${role.id} did not return a workflow vote in time.`,
+              publicResponse: `@${role.id} abstained.`,
+            },
+            role,
+            this.spec,
+            request,
+            coordinatorDecision,
+          );
+          this.emitWorkflowVoteResponse(voteWindow, response);
+          return response;
+        }
+      }),
+    );
+  }
+
+  private emitWorkflowVoteResponse(
+    voteWindow: WorkspaceWorkflowVoteWindow,
+    response: WorkspaceWorkflowVoteResponse,
+  ): void {
+    const event: WorkflowVoteResponseEvent = {
+      type: 'workflow.vote.response',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      voteId: voteWindow.voteId,
+      response,
+    };
+    this.emitEvent(event);
+    this.publishActivity(
+      response.decision === 'approve'
+        ? 'workflow_vote_approved'
+        : response.decision === 'reject'
+          ? 'workflow_vote_rejected'
+          : 'member_summary',
+      response.publicResponse ?? response.rationale,
+      {
+        roleId: response.roleId,
+        visibility: 'public',
+      },
+    );
+  }
+
+  private async collectClaimResponses(
+    claimWindow: WorkspaceClaimWindow,
+    request: WorkspaceTurnRequest,
+    timeoutMs = 120_000,
+  ): Promise<WorkspaceClaimResponse[]> {
+    const claimProbeTimeout = Math.max(
+      5_000,
+      Math.min(timeoutMs, this.spec.claimPolicy?.claimTimeoutMs ?? 30_000),
+    );
+
+    return Promise.all(
+      claimWindow.candidateRoleIds.map(async roleId => {
+        const role = this.spec.roles.find(value => value.id === roleId);
+        if (!role) {
+          const response: WorkspaceClaimResponse = {
+            roleId,
+            decision: 'decline',
+            confidence: 0,
+            rationale: `@${roleId} is not available for this claim window.`,
+            publicResponse: `@${roleId} passed on this request.`,
+          };
+          this.emitClaimResponse(claimWindow, response);
+          return response;
+        }
+        try {
+          const response = await this.probeRoleClaim(role, request, claimProbeTimeout);
+          this.emitClaimResponse(claimWindow, response);
+          return response;
+        } catch {
+          const response: WorkspaceClaimResponse = {
+            roleId: role.id,
+            decision: 'decline',
+            confidence: 0,
+            rationale: `@${role.id} did not return a valid claim response in time.`,
+            publicResponse: `@${role.id} passed on this request.`,
+          };
+          this.emitClaimResponse(claimWindow, response);
+          return response;
+        }
+      }),
+    );
+  }
+
+  private emitClaimResponse(
+    claimWindow: WorkspaceClaimWindow,
+    response: WorkspaceClaimResponse,
+  ): void {
+    const event: ClaimResponseEvent = {
+      type: 'claim.response',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      claimWindowId: claimWindow.windowId,
+      response,
+    };
+    this.emitEvent(event);
+    this.updateMemberState(
+      response.roleId,
+      'waiting',
+      response.publicResponse ?? response.rationale,
+    );
+    this.publishActivity(
+      response.decision === 'claim'
+        ? 'member_claimed'
+        : response.decision === 'support'
+          ? 'member_supporting'
+          : 'member_declined',
+      response.publicResponse ?? response.rationale,
+      {
+        roleId: response.roleId,
+        visibility: 'public',
+      },
+    );
+  }
+
+  private async probeRoleClaim(
+    role: RoleSpec,
+    request: WorkspaceTurnRequest,
+    timeoutMs: number,
+  ): Promise<WorkspaceClaimResponse> {
+    const thread = this.createClaimProbeThread(role);
+    const schema = {
+      type: 'object',
+      properties: {
+        decision: {
+          type: 'string',
+          enum: ['claim', 'support', 'decline'],
+        },
+        confidence: { type: 'number' },
+        rationale: { type: 'string' },
+        publicResponse: { type: 'string' },
+        proposedInstruction: { type: 'string' },
+      },
+      required: ['decision', 'confidence', 'rationale', 'publicResponse', 'proposedInstruction'],
+      additionalProperties: false,
+    } as const;
+
+    const turn = await thread.run(buildWorkspaceClaimPrompt(this.spec, role, request), {
+      outputSchema: schema,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return parseWorkspaceClaimResponse(turn.finalResponse, role, request);
+  }
+
+  private async probeWorkflowVote(
+    role: RoleSpec,
+    request: WorkspaceTurnRequest,
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    timeoutMs: number,
+  ): Promise<WorkspaceWorkflowVoteResponse> {
+    const thread = this.createClaimProbeThread(role);
+    const schema = {
+      type: 'object',
+      properties: {
+        decision: {
+          type: 'string',
+          enum: ['approve', 'reject', 'abstain'],
+        },
+        confidence: { type: 'number' },
+        rationale: { type: 'string' },
+        publicResponse: { type: 'string' },
+      },
+      required: ['decision', 'confidence', 'rationale', 'publicResponse'],
+      additionalProperties: false,
+    } as const;
+
+    const turn = await thread.run(
+      buildWorkflowVotePrompt(this.spec, role, request, coordinatorDecision),
+      {
+        outputSchema: schema,
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+    );
+    return parseWorkflowVoteResponse(
+      turn.finalResponse,
+      role,
+      this.spec,
+      request,
+      coordinatorDecision,
+    );
+  }
+
+  private async requestCoordinatorDecision(
+    request: WorkspaceTurnRequest,
+    timeoutMs = 120_000,
+  ): Promise<CoordinatorWorkflowDecision> {
+    const coordinatorRole = this.resolveCoordinatorRole();
+    const thread = this.createClaimProbeThread(coordinatorRole);
+    const schema = {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['respond', 'delegate', 'propose_workflow'] },
+        responseText: { type: 'string' },
+        targetRoleId: { type: 'string' },
+        workflowVoteReason: { type: 'string' },
+        rationale: { type: 'string' },
+      },
+      required: ['kind', 'responseText', 'targetRoleId', 'workflowVoteReason', 'rationale'],
+      additionalProperties: false,
+    } as const;
+
+    const turn = await thread.run(buildCoordinatorDecisionPrompt(this.spec, request), {
+      outputSchema: schema,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return parseCoordinatorDecision(turn.finalResponse, this.spec, request);
+  }
+
   private emitCoordinatorSummary(text: string, roleId: string): void {
     const event: WorkspaceMessageEvent = {
       type: 'message',
@@ -841,6 +1399,24 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     this.emitEvent(event);
     this.publishActivity('coordinator_message', text, {
       roleId,
+      visibility: 'public',
+    });
+  }
+
+  private emitWorkflowStarted(
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    voteWindow?: WorkspaceWorkflowVoteWindow,
+  ): void {
+    const event: WorkflowStartedEvent = {
+      type: 'workflow.started',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      coordinatorDecision,
+      ...(voteWindow ? { voteWindow } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_started', coordinatorDecision.responseText, {
+      roleId: this.resolveCoordinatorRole().id,
       visibility: 'public',
     });
   }
@@ -940,11 +1516,19 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       ...(note ? { note } : {}),
     };
     this.emitEvent(event);
-    this.publishActivity('member_claimed', note ?? `${member.roleName} claimed the task.`, {
+    this.publishActivity(
+      claimStatus === 'supporting'
+        ? 'member_supporting'
+        : claimStatus === 'declined'
+          ? 'member_declined'
+          : 'member_claimed',
+      note ?? `${member.roleName} claimed the task.`,
+      {
       roleId,
       dispatchId,
       visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
-    });
+      },
+    );
   }
 
   private ensureStarted(): void {
@@ -965,6 +1549,84 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     return {
       ...dispatch,
     };
+  }
+
+  private applyPersistedState(
+    snapshot: WorkspaceState,
+    providerState: PersistedProviderState,
+  ): void {
+    this.state.status = snapshot.status;
+    if (snapshot.sessionId) {
+      this.state.sessionId = snapshot.sessionId;
+    } else {
+      delete this.state.sessionId;
+    }
+    if (snapshot.startedAt) {
+      this.state.startedAt = snapshot.startedAt;
+    } else {
+      delete this.state.startedAt;
+    }
+    this.state.roles = { ...snapshot.roles };
+    this.state.dispatches = { ...snapshot.dispatches };
+    this.state.members = { ...snapshot.members };
+    this.state.activities = [...snapshot.activities];
+    this.state.workflowRuntime = { ...snapshot.workflowRuntime };
+
+    for (const binding of Object.values(providerState.memberBindings)) {
+      this.roleThreadIds.set(binding.roleId, binding.providerConversationId);
+    }
+  }
+
+  private buildProviderState(): PersistedProviderState {
+    return {
+      workspaceId: this.spec.id,
+      provider: 'codex-sdk',
+      ...(this.state.sessionId ? { rootConversationId: this.state.sessionId } : {}),
+      memberBindings: Object.fromEntries(
+        Array.from(this.roleThreadIds.entries()).map(([roleId, threadId]) => [
+          roleId,
+          {
+            roleId,
+            providerConversationId: threadId,
+            kind: 'thread' as const,
+            updatedAt: new Date().toISOString(),
+          },
+        ]),
+      ),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  private async ensurePersistenceInitialized(): Promise<void> {
+    if (!this.persistence) {
+      return;
+    }
+
+    if (this.restoredFromPersistence) {
+      return;
+    }
+
+    await this.persistence.ensureWorkspaceInitialized(this.spec);
+  }
+
+  private schedulePersistence(events: WorkspaceEvent[]): void {
+    if (!this.persistence) {
+      return;
+    }
+
+    this.persistenceFlushed = this.persistenceFlushed
+      .then(async () =>
+        this.persistence?.persistRuntime({
+          state: this.getSnapshot(),
+          events,
+          providerState: this.buildProviderState(),
+        }),
+      )
+      .catch(error => {
+        if (this.debug) {
+          console.warn('[multi-agent-runtime] codex persistence failed', error);
+        }
+      });
   }
 }
 

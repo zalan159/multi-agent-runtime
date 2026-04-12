@@ -56,11 +56,28 @@ Rust now mirrors the TypeScript authoring model:
 - profiles define provider/runtime defaults
 - `instantiate_workspace()` binds them into a concrete `WorkspaceSpec`
 - runtime state now includes `members`, `activities`, and `claimPolicy`
+- templates can also carry declarative `workflow`, `artifacts`, and `completion_policy`
 
 Built-in templates currently included in the protocol crate:
 - `create_coding_studio_template()`
 - `create_opc_solo_company_template()`
 - `create_autoresearch_template()`
+- `create_edict_governance_template()`
+
+Workflow node vocabulary currently modeled in the protocol:
+- `announce`
+- `assign`
+- `claim`
+- `shell`
+- `evaluate`
+- `review`
+- `branch`
+- `loop`
+- `artifact`
+- `commit`
+- `revert`
+- `merge`
+- `complete`
 
 ## Run Tests
 
