@@ -187,6 +187,25 @@ console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
+## Claude + Codex 混合模式
+
+现在 runtime 已经支持通过 `HybridWorkspace` 做“角色级 provider 混用”。
+
+适合这种场景：
+- Claude 角色负责计划、协调、进度追踪
+- Codex 角色负责写代码、跑验证
+- 对外仍然呈现为一个 workspace 的统一事件流
+
+使用上有两个关键点：
+- `spec.provider = 'hybrid'`
+- 每个角色都显式声明 `role.agent.provider`
+
+仓库里现在已经有一个参考 TypeScript 示例：[`src/examples/hybridClaudeCodex.ts`](./src/examples/hybridClaudeCodex.ts)，可以这样跑：
+
+```bash
+npm run smoke:hybrid -- /absolute/workspace/path "你的任务描述"
+```
+
 ## 运行时 API
 
 ### `runWorkspaceTurn()`

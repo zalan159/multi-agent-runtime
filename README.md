@@ -187,6 +187,25 @@ console.log(turn.dispatches[0]?.resultText);
 await workspace.close();
 ```
 
+## Hybrid Claude + Codex Pattern
+
+The runtime now supports role-level provider mixing through `HybridWorkspace`.
+
+Use this when you want one workspace where:
+- Claude-owned roles handle planning, coordination, or status tracking
+- Codex-owned roles handle coding and validation
+- the event stream still looks like one workspace
+
+The key requirement is:
+- set `spec.provider = 'hybrid'`
+- set `role.agent.provider` on every role
+
+There is a reference TypeScript example at [`src/examples/hybridClaudeCodex.ts`](./src/examples/hybridClaudeCodex.ts), runnable with:
+
+```bash
+npm run smoke:hybrid -- /absolute/workspace/path "your task here"
+```
+
 ## Runtime API
 
 ### `runWorkspaceTurn()`

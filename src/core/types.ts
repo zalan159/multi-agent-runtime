@@ -1,4 +1,5 @@
 export type MultiAgentProvider = 'claude-agent-sdk' | 'codex-sdk';
+export type WorkspaceProvider = MultiAgentProvider | 'hybrid';
 
 export type WorkspaceVisibility = 'public' | 'private' | 'coordinator';
 export type ClaimMode = 'direct' | 'claim' | 'coordinator_only';
@@ -72,6 +73,7 @@ export type PermissionMode =
 export interface RoleAgentSpec {
   description: string;
   prompt: string;
+  provider?: MultiAgentProvider;
   tools?: string[];
   disallowedTools?: string[];
   model?: string;
@@ -179,7 +181,7 @@ export interface WorkflowSpec {
 export interface WorkspaceSpec {
   id: string;
   name: string;
-  provider: MultiAgentProvider;
+  provider: WorkspaceProvider;
   model: string;
   cwd?: string;
   orchestratorPrompt?: string;
@@ -284,6 +286,7 @@ export interface TaskDispatch {
   dispatchId: string;
   workspaceId: string;
   roleId: string;
+  provider?: MultiAgentProvider;
   instruction: string;
   summary?: string;
   visibility?: WorkspaceVisibility;
@@ -306,6 +309,7 @@ export interface WorkspaceMember {
   workspaceId: string;
   roleId: string;
   roleName: string;
+  provider?: MultiAgentProvider;
   direct?: boolean;
   sessionId?: string;
   status: MemberStatus;
@@ -336,7 +340,7 @@ export interface WorkspaceWorkflowRuntimeState {
 export interface WorkspaceState {
   workspaceId: string;
   status: 'idle' | 'running' | 'requires_action' | 'closed';
-  provider: MultiAgentProvider;
+  provider: WorkspaceProvider;
   sessionId?: string;
   startedAt?: string;
   roles: Record<string, RoleSpec>;

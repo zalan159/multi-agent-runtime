@@ -3,8 +3,8 @@ import { dirname, join } from 'node:path';
 
 import type { WorkspaceEvent } from './events.js';
 import type {
-  MultiAgentProvider,
   RoleSpec,
+  WorkspaceProvider,
   WorkspaceSpec,
   WorkspaceState,
 } from './types.js';
@@ -20,7 +20,7 @@ export interface PersistedProviderBinding {
 
 export interface PersistedProviderState {
   workspaceId: string;
-  provider: MultiAgentProvider;
+  provider: WorkspaceProvider;
   rootConversationId?: string;
   memberBindings: Record<string, PersistedProviderBinding>;
   metadata?: Record<string, unknown>;
@@ -199,6 +199,12 @@ function renderAgentMarkdown(spec: WorkspaceSpec, role: RoleSpec): string {
   if (role.agent.model) {
     lines.push('## Model');
     lines.push(role.agent.model);
+    lines.push('');
+  }
+
+  if (role.agent.provider) {
+    lines.push('## Provider');
+    lines.push(role.agent.provider);
     lines.push('');
   }
 

@@ -20,6 +20,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke:coding": "npm run build && node ./examples/coding-studio.mjs",
+    "smoke:hybrid": "npm run build && node ./dist/examples/hybridClaudeCodex.js",
     "smoke:opc": "npm run build && node ./examples/opc-solo-company.mjs",
     "smoke:autoresearch": "npm run build && node ./examples/autoresearch.mjs",
     "e2e:coding": "npm run build && node --test ./tests/e2e/coding-studio.test.mjs",

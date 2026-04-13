@@ -5,6 +5,7 @@ export * from './core/localPersistence.js';
 export * from './core/workspaceTurn.js';
 export * from './adapters/claude/claudeAgentWorkspace.js';
 export * from './adapters/codex/codexSdkWorkspace.js';
+export * from './adapters/hybrid/hybridWorkspace.js';
 export * from './templates/autoresearch.js';
 export * from './templates/codingStudio.js';
 export * from './templates/edictGovernance.js';

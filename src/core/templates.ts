@@ -24,6 +24,7 @@ export type AgentCapability =
 export interface TemplateRoleAgentSpec {
   description: string;
   prompt: string;
+  provider?: MultiAgentProvider;
   capabilities?: AgentCapability[];
   model?: string;
   skills?: string[];
@@ -176,6 +177,7 @@ function instantiateRole(
     agent: {
       description: role.agent.description,
       prompt: role.agent.prompt,
+      ...(role.agent.provider ? { provider: role.agent.provider } : {}),
       ...(mappedTools && mappedTools.length > 0 ? { tools: mappedTools } : {}),
       ...(role.agent.model ? { model: role.agent.model } : {}),
       ...(role.agent.skills ? { skills: role.agent.skills } : {}),
