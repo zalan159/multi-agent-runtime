@@ -8,7 +8,8 @@ use multi_agent_protocol::{
     WorkspaceTemplate,
 };
 use multi_agent_runtime_cteno::{
-    AdapterError, CtenoWorkspaceAdapter, SessionMessenger, WorkspaceProvisioner,
+    AdapterError, CtenoWorkspaceAdapter, SessionMessenger, SessionRequestMode,
+    WorkspaceProvisioner,
 };
 
 #[derive(Clone, Default)]
@@ -92,6 +93,41 @@ impl SessionMessenger for FakeMessenger {
             .unwrap()
             .push((session_id.to_string(), message.to_string()));
         Ok(())
+    }
+
+    async fn request_response(
+        &self,
+        session_id: &str,
+        _message: &str,
+        mode: SessionRequestMode,
+    ) -> Result<String, AdapterError> {
+        let role_id = session_id.strip_prefix("session-").unwrap_or(session_id);
+        let response = match mode {
+            SessionRequestMode::Work => format!("handled by {}", role_id),
+            SessionRequestMode::Claim => {
+                if matches!(role_id, "prd" | "finance" | "scout" | "lead") {
+                    format!(
+                        r#"{{"decision":"claim","confidence":0.92,"rationale":"{} is the best owner"}} "#,
+                        role_id
+                    )
+                } else {
+                    r#"{"decision":"decline","confidence":0.35,"rationale":"not the best fit"}"#.to_string()
+                }
+            }
+            SessionRequestMode::WorkflowVote => {
+                r#"{"decision":"approve","confidence":0.88,"rationale":"workflow is appropriate"}"#.to_string()
+            }
+            SessionRequestMode::CoordinatorDecision => {
+                if role_id == "pm" {
+                    r#"{"decision":"delegate","summary":"delegate to the strongest claimant","role_ids":["prd"],"needs_workflow_vote":false}"#.to_string()
+                } else if role_id == "ceo" {
+                    r#"{"decision":"delegate","summary":"delegate to finance","role_ids":["finance"],"needs_workflow_vote":false}"#.to_string()
+                } else {
+                    r#"{"decision":"propose_workflow","summary":"start the research workflow","needs_workflow_vote":true}"#.to_string()
+                }
+            }
+        };
+        Ok(response.trim().to_string())
     }
 }
 
@@ -204,7 +240,8 @@ async fn run_template_dispatch_flow(
     let sent = sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].0, format!("session-{}", role_id));
-    assert_eq!(sent[0].1, instruction);
+    assert!(sent[0].1.contains("Current task for you:"));
+    assert!(sent[0].1.contains(instruction));
     drop(sent);
 
     let start_events = adapter

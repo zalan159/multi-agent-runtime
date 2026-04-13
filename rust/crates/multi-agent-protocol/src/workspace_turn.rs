@@ -6,6 +6,7 @@ use crate::{
     WorkspaceTurnAssignment, WorkspaceTurnPlan, WorkspaceTurnRequest, WorkspaceVisibility,
     WorkspaceWorkflowVoteResponse,
 };
+use serde_json::Value;
 
 pub fn plan_workspace_turn(spec: &WorkspaceSpec, request: &WorkspaceTurnRequest) -> WorkspaceTurnPlan {
     let coordinator_role_id = resolve_coordinator_role_id(spec);
@@ -47,6 +48,445 @@ pub fn direct_workspace_turn_plan(
         response_text: format!("@{} will take this next.", role_id),
         assignments: vec![build_assignment(role_id, &request.message, spec, None)],
         rationale: Some("Direct role targeting bypassed coordinator routing.".to_string()),
+    }
+}
+
+pub fn build_coordinator_decision_prompt(
+    spec: &WorkspaceSpec,
+    request: &WorkspaceTurnRequest,
+    claim_responses: Option<&[WorkspaceClaimResponse]>,
+) -> String {
+    let coordinator_role_id = resolve_coordinator_role_id(spec);
+    let max_assignments = std::cmp::max(
+        1,
+        request
+            .max_assignments
+            .or_else(|| spec.claim_policy.as_ref().and_then(|policy| policy.max_assignees))
+            .unwrap_or(1),
+    );
+    let fallback_role_id = spec
+        .claim_policy
+        .as_ref()
+        .and_then(|policy| policy.fallback_role_id.clone())
+        .or_else(|| spec.default_role_id.clone())
+        .unwrap_or_else(|| coordinator_role_id.clone());
+    let role_lines = spec
+        .roles
+        .iter()
+        .map(describe_role)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preferred_role_line = request.prefer_role_id.as_ref().map_or_else(
+        || {
+            "Choose the best role or small set of roles based on the actual work required."
+                .to_string()
+        },
+        |role_id| {
+            format!(
+                "Bias toward @{} if it is a strong fit, but do not force it if another role is clearly better.",
+                role_id
+            )
+        },
+    );
+    let claim_context = claim_responses
+        .filter(|responses| !responses.is_empty())
+        .map(|responses| {
+            let lines = responses
+                .iter()
+                .map(|response| {
+                    format!(
+                        "- @{} -> {} (confidence {:.2}): {}{}",
+                        response.role_id,
+                        claim_decision_label(response.decision),
+                        response.confidence,
+                        response.rationale,
+                        response
+                            .public_response
+                            .as_ref()
+                            .map(|value| format!(" | public: {}", value))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Team claim responses already collected. Use them when deciding whether to respond, delegate, or propose workflow.\n{}",
+                lines
+            )
+        })
+        .unwrap_or_default();
+
+    vec![
+        format!(
+            "You are @{}, the coordinator for the workspace \"{}\".",
+            coordinator_role_id, spec.name
+        ),
+        "A user just sent one workspace-level message. Treat it as visible to the whole team."
+            .to_string(),
+        "Your job is to choose exactly one of three paths:".to_string(),
+        "1. `respond`: you answer directly without delegating and without starting workflow."
+            .to_string(),
+        "2. `delegate`: you direct one specialist role to take this next, still staying in group-chat mode."
+            .to_string(),
+        "3. `propose_workflow`: you think this needs programmatic workflow execution, so you ask the team to vote on entering workflow mode."
+            .to_string(),
+        preferred_role_line,
+        format!("You may assign at most {} role(s).", max_assignments),
+        format!(
+            "Fallback role if no specialist clearly fits: @{}.",
+            fallback_role_id
+        ),
+        "Return strict JSON only. Do not wrap it in markdown fences. Do not add prose before or after the JSON."
+            .to_string(),
+        "JSON schema:".to_string(),
+        serde_json::json!({
+            "kind": "respond | delegate | propose_workflow",
+            "responseText": "A short public coordinator response.",
+            "targetRoleId": "one valid workspace role id when kind=delegate, otherwise empty string",
+            "workflowVoteReason": "short reason for entering workflow mode when kind=propose_workflow, otherwise empty string",
+            "rationale": "One short sentence explaining the routing decision."
+        })
+        .to_string(),
+        "Available roles:".to_string(),
+        role_lines,
+        "User workspace message:".to_string(),
+        request.message.clone(),
+        if claim_context.is_empty() {
+            String::new()
+        } else {
+            claim_context
+        },
+        "Rules:".to_string(),
+        "- Use only valid roleId values from the available roles. Return bare ids like `prd`, not `@prd`."
+            .to_string(),
+        "- Prefer `respond` or `delegate` by default.".to_string(),
+        "- Use `propose_workflow` only when the task clearly needs staged programmatic flow, loops, gates, or formal deliverable progression."
+            .to_string(),
+        "- If kind=`delegate`, choose one specialist role instead of opening workflow vote."
+            .to_string(),
+        "- Keep responseText concise and public-facing.".to_string(),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+pub fn parse_coordinator_decision(
+    raw_text: &str,
+    spec: &WorkspaceSpec,
+    request: &WorkspaceTurnRequest,
+) -> CoordinatorWorkflowDecision {
+    let coordinator_role_id = resolve_coordinator_role_id(spec);
+    let parsed = extract_json_object(raw_text);
+    let kind = parsed
+        .as_ref()
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_lowercase())
+        .unwrap_or_else(|| "delegate".to_string());
+    let target_role_id = parsed
+        .as_ref()
+        .and_then(|value| value.get("targetRoleId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role_id| spec.roles.iter().any(|role| role.id == *role_id))
+        .map(ToString::to_string);
+    let workflow_vote_reason = parsed
+        .as_ref()
+        .and_then(|value| value.get("workflowVoteReason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let response_text = parsed
+        .as_ref()
+        .and_then(|value| value.get("responseText"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| match kind.as_str() {
+            "respond" => format!("@{} will handle this directly.", coordinator_role_id),
+            "propose_workflow" => format!(
+                "@{} proposes entering workflow mode for this request.",
+                coordinator_role_id
+            ),
+            _ => format!(
+                "@{} will take this next.",
+                target_role_id
+                    .clone()
+                    .unwrap_or_else(|| coordinator_role_id.clone())
+            ),
+        });
+    let normalized_kind = if kind == "propose_workflow" && spec.workflow.is_some() {
+        CoordinatorDecisionKind::ProposeWorkflow
+    } else if should_propose_workflow_heuristically(spec, &request.message) {
+        CoordinatorDecisionKind::ProposeWorkflow
+    } else if kind == "delegate" && target_role_id.is_some() {
+        CoordinatorDecisionKind::Delegate
+    } else {
+        CoordinatorDecisionKind::Respond
+    };
+
+    CoordinatorWorkflowDecision {
+        kind: normalized_kind,
+        response_text,
+        target_role_id,
+        workflow_vote_reason: if workflow_vote_reason.is_some()
+            || normalized_kind == CoordinatorDecisionKind::ProposeWorkflow
+        {
+            Some(workflow_vote_reason.unwrap_or_else(|| {
+                "This request appears to need staged workflow execution with formal flow control."
+                    .to_string()
+            }))
+        } else {
+            None
+        },
+        rationale: parsed
+            .as_ref()
+            .and_then(|value| value.get("rationale"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    }
+}
+
+pub fn build_workspace_claim_prompt(
+    spec: &WorkspaceSpec,
+    role: &RoleSpec,
+    request: &WorkspaceTurnRequest,
+) -> String {
+    vec![
+        format!(
+            "You are @{} ({}) in the workspace \"{}\".",
+            role.id, role.name, spec.name
+        ),
+        role.description
+            .as_ref()
+            .map(|value| format!("Role description: {}", value))
+            .unwrap_or_default(),
+        format!("Agent description: {}", role.agent.description),
+        role.output_root
+            .as_ref()
+            .map(|value| format!("Preferred output root: {}", value))
+            .unwrap_or_default(),
+        "A new workspace message is visible to the whole team.".to_string(),
+        "Your job right now is only to decide whether you should claim this task, support another owner, or decline."
+            .to_string(),
+        "Do not perform the work yet. Do not use tools. Do not write files. Do not answer with prose outside JSON."
+            .to_string(),
+        "Return strict JSON with this schema:".to_string(),
+        serde_json::json!({
+            "decision": "claim | support | decline",
+            "confidence": 0.0,
+            "rationale": "one short sentence explaining the decision",
+            "publicResponse": "short public update that can appear in the workspace timeline, or an empty string if none",
+            "proposedInstruction": "concrete next step you would execute if chosen as owner or supporter, or an empty string if none"
+        })
+        .to_string(),
+        "Decision rules:".to_string(),
+        "- Use `claim` when you should be a primary owner for this request.".to_string(),
+        "- Use `support` when you can contribute meaningfully but should not be the main owner."
+            .to_string(),
+        "- Use `decline` when another role is a better fit or the task is outside your lane."
+            .to_string(),
+        "- Set confidence between 0 and 1.".to_string(),
+        "- Keep rationale and publicResponse concise.".to_string(),
+        "- Always include every JSON field. Use an empty string for publicResponse or proposedInstruction when you have nothing useful to add."
+            .to_string(),
+        "Workspace message:".to_string(),
+        request.message.clone(),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+pub fn parse_workspace_claim_response(
+    raw_input: &str,
+    role: &RoleSpec,
+    request: &WorkspaceTurnRequest,
+) -> WorkspaceClaimResponse {
+    let parsed = extract_json_object(raw_input);
+    let decision = normalize_claim_decision(
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("decision"))
+            .and_then(Value::as_str),
+        role,
+        &request.message,
+    );
+    let confidence = normalize_confidence(
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("confidence"))
+            .and_then(Value::as_f64),
+        decision,
+    );
+    let rationale = parsed
+        .as_ref()
+        .and_then(|value| value.get("rationale"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| fallback_claim_rationale(role, decision, &request.message));
+    let public_response = parsed
+        .as_ref()
+        .and_then(|value| value.get("publicResponse"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let proposed_instruction = parsed
+        .as_ref()
+        .and_then(|value| value.get("proposedInstruction"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    WorkspaceClaimResponse {
+        role_id: role.id.clone(),
+        decision,
+        confidence,
+        rationale,
+        public_response,
+        proposed_instruction,
+    }
+}
+
+pub fn build_workflow_vote_prompt(
+    spec: &WorkspaceSpec,
+    role: &RoleSpec,
+    request: &WorkspaceTurnRequest,
+    coordinator_decision: &CoordinatorWorkflowDecision,
+) -> String {
+    vec![
+        format!(
+            "You are @{} ({}) in the workspace \"{}\".",
+            role.id, role.name, spec.name
+        ),
+        role.description
+            .as_ref()
+            .map(|value| format!("Role description: {}", value))
+            .unwrap_or_default(),
+        format!("Agent description: {}", role.agent.description),
+        "The coordinator is considering switching this request from normal group-chat handling into workflow mode."
+            .to_string(),
+        format!(
+            "Coordinator public message: {}",
+            coordinator_decision.response_text
+        ),
+        coordinator_decision
+            .workflow_vote_reason
+            .as_ref()
+            .map(|value| format!("Workflow proposal reason: {}", value))
+            .unwrap_or_default(),
+        "Your job is only to vote on whether this request should enter workflow mode now."
+            .to_string(),
+        "Return strict JSON only. Do not use tools. Do not do the work yet.".to_string(),
+        "Return strict JSON with this schema:".to_string(),
+        serde_json::json!({
+            "decision": "approve | reject | abstain",
+            "confidence": 0.0,
+            "rationale": "one short sentence explaining your vote",
+            "publicResponse": "short public update for the workspace timeline, or an empty string"
+        })
+        .to_string(),
+        "Decision rules:".to_string(),
+        "- Use `approve` when formal workflow execution is the best next step.".to_string(),
+        "- Use `reject` when normal group-chat delegation is enough.".to_string(),
+        "- Use `abstain` only when you genuinely cannot judge whether workflow mode is warranted."
+            .to_string(),
+        "- If the request clearly needs staged execution, loops, gates, review, or keep/discard control, do not abstain."
+            .to_string(),
+        if role.id == coordinator_role_id(spec) && coordinator_decision.kind == CoordinatorDecisionKind::ProposeWorkflow {
+            "- You are the coordinator who proposed workflow mode. Do not abstain unless you explicitly changed your mind."
+                .to_string()
+        } else {
+            String::new()
+        },
+        "- Keep rationale and publicResponse concise.".to_string(),
+        "Workspace message:".to_string(),
+        request.message.clone(),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+pub fn parse_workflow_vote_response(
+    raw_input: &str,
+    role: &RoleSpec,
+    spec: &WorkspaceSpec,
+    request: &WorkspaceTurnRequest,
+    coordinator_decision: &CoordinatorWorkflowDecision,
+) -> WorkspaceWorkflowVoteResponse {
+    let parsed = extract_json_object(raw_input);
+    let raw_decision = parsed
+        .as_ref()
+        .and_then(|value| value.get("decision"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_lowercase())
+        .unwrap_or_else(|| "abstain".to_string());
+    let parsed_decision = match raw_decision.as_str() {
+        "approve" => WorkflowVoteDecision::Approve,
+        "reject" => WorkflowVoteDecision::Reject,
+        _ => WorkflowVoteDecision::Abstain,
+    };
+    let decision = normalize_workflow_vote_decision(
+        parsed_decision,
+        spec,
+        request,
+        coordinator_decision,
+        role,
+    );
+    let confidence = normalize_confidence(
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("confidence"))
+            .and_then(Value::as_f64),
+        match decision {
+            WorkflowVoteDecision::Approve => ClaimDecision::Claim,
+            _ => ClaimDecision::Decline,
+        },
+    );
+    let rationale = parsed
+        .as_ref()
+        .and_then(|value| value.get("rationale"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("@{} voted {:?} on entering workflow mode.", role.id, decision).to_lowercase());
+    let public_response = parsed
+        .as_ref()
+        .and_then(|value| value.get("publicResponse"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| match decision {
+            WorkflowVoteDecision::Approve => {
+                Some(format!("@{} approves entering workflow mode.", role.id))
+            }
+            WorkflowVoteDecision::Reject => {
+                Some(format!("@{} prefers to stay in group-chat mode.", role.id))
+            }
+            WorkflowVoteDecision::Abstain => None,
+        });
+
+    WorkspaceWorkflowVoteResponse {
+        role_id: role.id.clone(),
+        decision,
+        confidence,
+        rationale,
+        public_response,
     }
 }
 
@@ -239,35 +679,39 @@ pub fn resolve_claim_candidate_role_ids(
     spec: &WorkspaceSpec,
     request: &WorkspaceTurnRequest,
 ) -> Vec<String> {
-    let max_assignments = usize::from(
-        request
-            .max_assignments
-            .or_else(|| spec.claim_policy.as_ref().and_then(|policy| policy.max_assignees))
-            .unwrap_or(1)
-            .max(1),
-    );
+    let all_role_ids = spec
+        .roles
+        .iter()
+        .map(|role| role.id.clone())
+        .collect::<Vec<_>>();
     let candidates = resolve_workflow_candidates(spec, &request.message);
-    if candidates.is_empty() {
-        return spec.roles.iter().map(|role| role.id.clone()).collect();
+    let mut ordered_role_ids = Vec::new();
+
+    if let Some(preferred_role_id) = request
+        .prefer_role_id
+        .as_ref()
+        .filter(|role_id| all_role_ids.iter().any(|candidate| candidate == *role_id))
+    {
+        ordered_role_ids.push(preferred_role_id.clone());
     }
 
-    let mut role_ids = Vec::new();
     for candidate in candidates {
-        if let Some(role_id) = choose_best_candidate_role(spec, &request.message, &candidate.role_ids) {
-            if !role_ids.contains(&role_id) {
-                role_ids.push(role_id);
-            }
-            if role_ids.len() >= max_assignments {
-                return role_ids;
+        if let Some(role_id) =
+            choose_best_candidate_role(spec, &request.message, &candidate.role_ids)
+        {
+            if !ordered_role_ids.contains(&role_id) {
+                ordered_role_ids.push(role_id);
             }
         }
     }
 
-    if role_ids.is_empty() {
-        spec.roles.iter().map(|role| role.id.clone()).collect()
-    } else {
-        role_ids
+    for role_id in all_role_ids {
+        if !ordered_role_ids.contains(&role_id) {
+            ordered_role_ids.push(role_id);
+        }
     }
+
+    ordered_role_ids
 }
 
 pub fn build_plan_from_claim_responses(
@@ -831,7 +1275,7 @@ fn workflow_node_priority(node_type: crate::WorkflowNodeType) -> usize {
     }
 }
 
-fn should_propose_workflow_heuristically(spec: &WorkspaceSpec, message: &str) -> bool {
+pub fn should_propose_workflow_heuristically(spec: &WorkspaceSpec, message: &str) -> bool {
     let Some(workflow) = spec.workflow.as_ref() else {
         return false;
     };
@@ -1030,6 +1474,99 @@ fn build_search_tokens(text: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+fn describe_role(role: &RoleSpec) -> String {
+    let mut parts = vec![format!("@{} ({})", role.id, role.name)];
+    if let Some(description) = role.description.as_ref() {
+        parts.push(description.clone());
+    }
+    parts.push(role.agent.description.clone());
+    if let Some(output_root) = role.output_root.as_ref() {
+        parts.push(format!("output root: {}", output_root));
+    }
+    parts.join(" — ")
+}
+
+fn claim_decision_label(decision: ClaimDecision) -> &'static str {
+    match decision {
+        ClaimDecision::Claim => "claim",
+        ClaimDecision::Support => "support",
+        ClaimDecision::Decline => "decline",
+    }
+}
+
+fn coordinator_role_id(spec: &WorkspaceSpec) -> String {
+    resolve_coordinator_role_id(spec)
+}
+
+fn extract_json_object(raw_text: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(raw_text.trim()) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+
+    let start = raw_text.find('{')?;
+    let end = raw_text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&raw_text[start..=end]).ok()
+}
+
+fn normalize_claim_decision(
+    raw_decision: Option<&str>,
+    role: &RoleSpec,
+    message: &str,
+) -> ClaimDecision {
+    match raw_decision
+        .map(|value| value.trim().to_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "claim" => ClaimDecision::Claim,
+        "support" => ClaimDecision::Support,
+        "decline" => ClaimDecision::Decline,
+        _ => {
+            let lowered = message.to_lowercase();
+            let score = score_role_for_message(role, &lowered);
+            if score >= 3 {
+                ClaimDecision::Claim
+            } else if score > 0 {
+                ClaimDecision::Support
+            } else {
+                ClaimDecision::Decline
+            }
+        }
+    }
+}
+
+fn normalize_confidence(raw_confidence: Option<f64>, decision: ClaimDecision) -> f32 {
+    raw_confidence
+        .map(|value| value.clamp(0.0, 1.0) as f32)
+        .unwrap_or(match decision {
+            ClaimDecision::Claim => 0.9,
+            ClaimDecision::Support => 0.6,
+            ClaimDecision::Decline => 0.25,
+        })
+}
+
+fn fallback_claim_rationale(role: &RoleSpec, decision: ClaimDecision, message: &str) -> String {
+    match decision {
+        ClaimDecision::Claim => format!(
+            "@{} is a strong fit for this request based on the current message.",
+            role.id
+        ),
+        ClaimDecision::Support => format!(
+            "@{} can contribute, but another role may be the primary owner.",
+            role.id
+        ),
+        ClaimDecision::Decline => format!(
+            "@{} is not the clearest owner for \"{}\".",
+            role.id, message
+        ),
+    }
 }
 
 fn extract_requested_output_path(message: &str) -> Option<String> {
@@ -1240,6 +1777,7 @@ mod tests {
         );
 
         assert_eq!(role_ids.first().map(String::as_str), Some("prd"));
+        assert_eq!(role_ids.len(), spec.roles.len());
     }
 
     #[test]
@@ -1264,6 +1802,7 @@ mod tests {
         );
 
         assert_eq!(role_ids.first().map(String::as_str), Some("scout"));
+        assert_eq!(role_ids.len(), spec.roles.len());
     }
 
     #[test]
