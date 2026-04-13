@@ -9,7 +9,9 @@ import type {
   WorkflowArtifactSpec,
   WorkflowSpec,
   WorkspaceSpec,
+  WorkspaceProvider,
 } from './types.js';
+import { DEFAULT_PROVIDER_MODELS } from './providerResolution.js';
 
 export type AgentCapability =
   | 'read'
@@ -24,6 +26,7 @@ export type AgentCapability =
 export interface TemplateRoleAgentSpec {
   description: string;
   prompt: string;
+  provider?: MultiAgentProvider;
   capabilities?: AgentCapability[];
   model?: string;
   skills?: string[];
@@ -48,6 +51,8 @@ export interface WorkspaceTemplate {
   templateId: string;
   templateName: string;
   description?: string;
+  provider?: MultiAgentProvider;
+  model?: string;
   defaultRoleId?: string;
   coordinatorRoleId?: string;
   orchestratorPrompt?: string;
@@ -66,8 +71,8 @@ export interface WorkspaceInstanceParams {
 }
 
 export interface WorkspaceProfile {
-  provider: MultiAgentProvider;
-  model: string;
+  provider?: MultiAgentProvider;
+  model?: string;
   permissionMode?: PermissionMode;
   roleEditPermissionMode?: PermissionMode;
   settingSources?: Array<'user' | 'project' | 'local'>;
@@ -127,11 +132,17 @@ export function createCodexWorkspaceProfile(options: {
 export function instantiateWorkspace(
   template: WorkspaceTemplate,
   instance: WorkspaceInstanceParams,
-  profile: WorkspaceProfile,
+  profile: WorkspaceProfile = {},
 ): WorkspaceSpec {
+  const defaultProvider = profile.provider ?? template.provider;
+  const defaultModel =
+    profile.model ??
+    template.model ??
+    (defaultProvider ? DEFAULT_PROVIDER_MODELS[defaultProvider] : undefined);
   const roles = template.roles.map(role =>
     instantiateRole(role, profile),
   );
+  const runtimeProvider = inferRuntimeProvider(template, roles, defaultProvider);
 
   const derivedAllowedTools = uniqueStrings(
     roles.flatMap(role => role.agent.tools ?? []),
@@ -140,8 +151,9 @@ export function instantiateWorkspace(
   return {
     id: instance.id,
     name: instance.name,
-    provider: profile.provider,
-    model: profile.model,
+    provider: runtimeProvider,
+    ...(defaultProvider ? { defaultProvider } : {}),
+    ...(defaultModel ? { defaultModel, model: defaultModel } : {}),
     ...(instance.cwd ? { cwd: instance.cwd } : {}),
     ...(template.orchestratorPrompt
       ? { orchestratorPrompt: template.orchestratorPrompt }
@@ -176,6 +188,7 @@ function instantiateRole(
     agent: {
       description: role.agent.description,
       prompt: role.agent.prompt,
+      ...(role.agent.provider ? { provider: role.agent.provider } : {}),
       ...(mappedTools && mappedTools.length > 0 ? { tools: mappedTools } : {}),
       ...(role.agent.model ? { model: role.agent.model } : {}),
       ...(role.agent.skills ? { skills: role.agent.skills } : {}),
@@ -203,4 +216,39 @@ function mapCapabilities(capabilities: AgentCapability[]): string[] {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function inferRuntimeProvider(
+  template: WorkspaceTemplate,
+  roles: RoleSpec[],
+  defaultProvider?: MultiAgentProvider,
+): WorkspaceProvider {
+  const providers = new Set<MultiAgentProvider>();
+  if (defaultProvider) {
+    providers.add(defaultProvider);
+  }
+
+  for (const role of roles) {
+    if (role.agent.provider) {
+      providers.add(role.agent.provider);
+    }
+  }
+
+  for (const node of template.workflow?.nodes ?? []) {
+    if (node.provider) {
+      providers.add(node.provider);
+    }
+  }
+
+  if (providers.size === 0) {
+    throw new Error(
+      `Workspace template "${template.templateName}" does not declare a provider and no profile provider was supplied.`,
+    );
+  }
+
+  if (providers.size === 1) {
+    return providers.values().next().value as MultiAgentProvider;
+  }
+
+  return 'hybrid';
 }

@@ -22,6 +22,7 @@ import type {
   DispatchResultEvent,
   ToolProgressEvent,
   WorkflowStartedEvent,
+  WorkflowStageEvent,
   WorkflowVoteResponseEvent,
   WorkflowVoteWindowClosedEvent,
   WorkflowVoteWindowOpenedEvent,
@@ -36,6 +37,11 @@ import {
   type PersistedProviderState,
   LocalWorkspacePersistence,
 } from '../../core/localPersistence.js';
+import {
+  resolveDispatchTarget,
+  resolveRoleModel,
+  resolveWorkspaceDefaultModel,
+} from '../../core/providerResolution.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
   ClaimStatus,
@@ -53,6 +59,7 @@ import type {
   WorkspaceTurnRequest,
   WorkspaceTurnResult,
   WorkspaceVisibility,
+  WorkflowWorklistRuntimeState,
   WorkspaceWorkflowVoteResponse,
   WorkspaceWorkflowVoteWindow,
 } from '../../core/types.js';
@@ -72,6 +79,7 @@ import {
   resolveWorkflowVoteCandidateRoleIds,
   shouldApproveWorkflowVote,
 } from '../../core/workspaceTurn.js';
+import { executeWorkflow } from '../../core/workflowExecution.js';
 
 export interface CodexSdkWorkspaceOptions {
   spec: WorkspaceSpec;
@@ -250,16 +258,28 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       throw new Error(`Unknown role: ${request.roleId}`);
     }
 
+    const target = resolveDispatchTarget(this.spec, role, request);
+    if (target.provider !== 'codex-sdk') {
+      throw new Error(
+        `CodexSdkWorkspace cannot execute provider "${target.provider}" for role "${role.id}".`,
+      );
+    }
+
     const dispatch: TaskDispatch = {
       dispatchId: randomUUID(),
       workspaceId: this.spec.id,
       roleId: role.id,
+      provider: target.provider,
+      model: target.model,
       instruction: request.instruction,
       status: 'queued',
       createdAt: new Date().toISOString(),
       ...(request.summary ? { summary: request.summary } : {}),
       ...(request.visibility ? { visibility: request.visibility } : {}),
       ...(request.sourceRoleId ? { sourceRoleId: request.sourceRoleId } : {}),
+      ...(request.workflowNodeId ? { workflowNodeId: request.workflowNodeId } : {}),
+      ...(request.stageId ? { stageId: request.stageId } : {}),
+      ...(request.workItemId ? { workItemId: request.workItemId } : {}),
       ...(this.spec.claimPolicy?.mode !== 'claim'
         ? {
             claimStatus: 'claimed' satisfies ClaimStatus,
@@ -435,26 +455,15 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       );
     }
 
-    const dispatches: TaskDispatch[] = [];
-    for (const assignment of plan.assignments) {
-      const dispatch = await this.assignRoleTask({
-        roleId: assignment.roleId,
-        instruction: assignment.instruction,
-        ...(assignment.summary ? { summary: assignment.summary } : {}),
-        visibility: assignment.visibility ?? request.visibility ?? 'public',
-        sourceRoleId: coordinatorRole.id,
-      });
-      const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
-      this.claimDispatch(
-        dispatch.dispatchId,
-        assignment.roleId,
-        claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
-        claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
-      );
-      dispatches.push(
-        await this.runDispatch(Promise.resolve(dispatch), options),
-      );
-    }
+    const dispatches = shouldRunWorkflow
+      ? await this.executeWorkflowTurn(effectiveRequest, coordinatorRole.id, options)
+      : await this.executePlannedAssignments(
+          plan.assignments,
+          request,
+          coordinatorRole.id,
+          claimResponses,
+          options,
+        );
 
     return {
       request,
@@ -465,6 +474,79 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       plan,
       dispatches,
     };
+  }
+
+  private async executePlannedAssignments(
+    assignments: WorkspaceTurnResult['plan']['assignments'],
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    claimResponses: WorkspaceClaimResponse[] | undefined,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
+    const dispatches: TaskDispatch[] = [];
+    for (const assignment of assignments) {
+      const dispatch = await this.assignRoleTask({
+        roleId: assignment.roleId,
+        instruction: assignment.instruction,
+        ...(assignment.summary ? { summary: assignment.summary } : {}),
+        ...(assignment.provider ? { provider: assignment.provider } : {}),
+        ...(assignment.model ? { model: assignment.model } : {}),
+        visibility: assignment.visibility ?? request.visibility ?? 'public',
+        sourceRoleId: coordinatorRoleId,
+        ...(assignment.workflowNodeId ? { workflowNodeId: assignment.workflowNodeId } : {}),
+        ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
+      });
+      const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
+      this.claimDispatch(
+        dispatch.dispatchId,
+        assignment.roleId,
+        claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
+        claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
+      );
+      dispatches.push(await this.runDispatch(Promise.resolve(dispatch), options));
+    }
+    return dispatches;
+  }
+
+  private async executeWorkflowTurn(
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
+    const result = await executeWorkflow(
+      this.spec,
+      request,
+      async (assignment, node) => {
+        const dispatch = await this.assignRoleTask({
+          roleId: assignment.roleId,
+          instruction: assignment.instruction,
+          ...(assignment.summary ? { summary: assignment.summary } : {}),
+          ...(assignment.provider ? { provider: assignment.provider } : {}),
+          ...(assignment.model ? { model: assignment.model } : {}),
+          visibility: assignment.visibility ?? request.visibility ?? 'public',
+          sourceRoleId: coordinatorRoleId,
+          workflowNodeId: node.id,
+          ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
+          ...(assignment.workItemId ? { workItemId: assignment.workItemId } : {}),
+        });
+        this.claimDispatch(
+          dispatch.dispatchId,
+          assignment.roleId,
+          `Claimed workflow node "${node.title ?? node.id}".`,
+          'claimed',
+        );
+        return this.runDispatch(Promise.resolve(dispatch), options);
+      },
+      {
+        onNodeStarted: node => this.enterWorkflowNode(node),
+        onStageStarted: (stageId, node) => this.emitWorkflowStageStarted(stageId, node),
+        onStageCompleted: (stageId, node) => this.emitWorkflowStageCompleted(stageId, node),
+        onWorklistUpdated: (node, worklist) => this.updateWorklistState(node.id, worklist),
+        onCompleted: (workflowResult, lastNode) => this.finishWorkflowExecution(workflowResult.completionStatus, lastNode),
+      },
+    );
+
+    return result.dispatches;
   }
 
   async deleteWorkspace(): Promise<void> {
@@ -502,7 +584,12 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
   }
 
   private async executeDispatch(role: RoleSpec, dispatch: TaskDispatch): Promise<void> {
-    const thread = this.ensureRoleThread(role);
+    const defaultModel = resolveRoleModel(this.spec, role);
+    const model = dispatch.model ?? defaultModel;
+    const usePersistentThread = model === defaultModel;
+    const thread = usePersistentThread
+      ? this.ensureRoleThread(role)
+      : this.createThread(role, model);
     const controller = new AbortController();
     this.activeRuns.set(dispatch.dispatchId, {
       controller,
@@ -524,8 +611,10 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
 
       for await (const event of events) {
         if (event.type === 'thread.started') {
-          this.roleThreadIds.set(role.id, event.thread_id);
-          this.roleThreads.set(role.id, thread);
+          if (usePersistentThread) {
+            this.roleThreadIds.set(role.id, event.thread_id);
+            this.roleThreads.set(role.id, thread);
+          }
           this.activeRuns.get(dispatch.dispatchId)!.threadId = event.thread_id;
           this.state.sessionId = event.thread_id;
 
@@ -625,7 +714,9 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       if (!completed) {
         const threadId = thread.id ?? dispatch.dispatchId;
         if (thread.id) {
-          this.roleThreadIds.set(role.id, thread.id);
+          if (usePersistentThread) {
+            this.roleThreadIds.set(role.id, thread.id);
+          }
         }
         this.finishDispatch(
           dispatch.dispatchId,
@@ -665,9 +756,9 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     return thread;
   }
 
-  private createThread(role: RoleSpec): Thread {
+  private createThread(role: RoleSpec, model = resolveRoleModel(this.spec, role)): Thread {
     return this.client.startThread({
-      model: role.agent.model ?? this.spec.model,
+      model,
       ...(this.sandboxMode ? { sandboxMode: this.sandboxMode } : {}),
       ...(this.workingDirectory
         ? { workingDirectory: this.workingDirectory }
@@ -689,7 +780,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
 
   private createClaimProbeThread(role: RoleSpec): Thread {
     return this.client.startThread({
-      model: role.agent.model ?? this.spec.model,
+      model: resolveRoleModel(this.spec, role),
       sandboxMode: 'read-only',
       ...(this.workingDirectory
         ? { workingDirectory: this.workingDirectory }
@@ -1288,7 +1379,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     );
   }
 
-  private async probeRoleClaim(
+  async probeRoleClaim(
     role: RoleSpec,
     request: WorkspaceTurnRequest,
     timeoutMs: number,
@@ -1317,7 +1408,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     return parseWorkspaceClaimResponse(turn.finalResponse, role, request);
   }
 
-  private async probeWorkflowVote(
+  async probeWorkflowVote(
     role: RoleSpec,
     request: WorkspaceTurnRequest,
     coordinatorDecision: CoordinatorWorkflowDecision,
@@ -1355,7 +1446,7 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
     );
   }
 
-  private async requestCoordinatorDecision(
+  async requestCoordinatorDecision(
     request: WorkspaceTurnRequest,
     timeoutMs = 120_000,
   ): Promise<CoordinatorWorkflowDecision> {
@@ -1419,6 +1510,76 @@ export class CodexSdkWorkspace extends WorkspaceRuntime {
       roleId: this.resolveCoordinatorRole().id,
       visibility: 'public',
     });
+  }
+
+  private enterWorkflowNode(node: { id: string; stageId?: string; title?: string }): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      mode: 'workflow_running',
+      activeNodeId: node.id,
+      ...(node.stageId ? { activeStageId: node.stageId } : {}),
+    };
+  }
+
+  private emitWorkflowStageStarted(stageId: string, node: { id: string; title?: string; roleId?: string; reviewerRoleId?: string }): void {
+    const event: WorkflowStageEvent = {
+      type: 'workflow.stage.started',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_stage_started', `Workflow stage started: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private emitWorkflowStageCompleted(stageId: string, node: { id: string; title?: string; roleId?: string; reviewerRoleId?: string }): void {
+    const event: WorkflowStageEvent = {
+      type: 'workflow.stage.completed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_stage_completed', `Workflow stage completed: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private finishWorkflowExecution(
+    status: 'done' | 'stuck' | 'discarded' | 'crash',
+    lastNode?: { id: string; title?: string; stageId?: string },
+  ): void {
+    this.state.workflowRuntime = {
+      mode: 'group_chat',
+      ...(this.state.workflowRuntime.worklists
+        ? { worklists: { ...this.state.workflowRuntime.worklists } }
+        : {}),
+    };
+    this.publishActivity(
+      'workflow_completed',
+      `Workflow ${status} at ${lastNode?.title ?? lastNode?.id ?? 'unknown node'}.`,
+      {
+        visibility: 'public',
+      },
+    );
+  }
+
+  private updateWorklistState(nodeId: string, worklist: WorkflowWorklistRuntimeState): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      worklists: {
+        ...(this.state.workflowRuntime.worklists ?? {}),
+        [nodeId]: worklist,
+      },
+    };
   }
 
   private emitStateChanged(state: WorkspaceStateChangedEvent['state']): void {

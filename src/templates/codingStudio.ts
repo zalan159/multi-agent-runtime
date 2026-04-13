@@ -5,6 +5,7 @@ export function createCodingStudioTemplate(): WorkspaceTemplate {
     templateId: 'coding-studio',
     templateName: 'Coding Studio',
     description: 'A software delivery workspace with fixed specialist roles.',
+    provider: 'claude-agent-sdk',
     defaultRoleId: 'pm',
     coordinatorRoleId: 'pm',
     orchestratorPrompt:

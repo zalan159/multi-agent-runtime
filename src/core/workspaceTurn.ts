@@ -13,6 +13,7 @@ import type {
   WorkspaceVisibility,
   WorkspaceWorkflowVoteResponse,
 } from './types.js';
+import { resolveWorkflowNodeModel, resolveWorkflowNodeProvider } from './providerResolution.js';
 
 export function buildCoordinatorDecisionPrompt(
   spec: WorkspaceSpec,
@@ -302,6 +303,7 @@ export function buildPlanFromClaimResponses(
   const fallbackRoleId =
     spec.claimPolicy?.fallbackRoleId ?? spec.defaultRoleId ?? coordinatorRoleId;
   const fallbackAssignment = buildFallbackAssignment(
+    spec,
     guessFallbackRoleId(spec, request.message, fallbackRoleId),
     request.message,
   );
@@ -379,7 +381,7 @@ export function parseWorkspaceTurnPlan(
 
   const finalAssignments = assignments.length > 0
     ? assignments
-    : [buildFallbackAssignment(guessFallbackRoleId(spec, request.message, fallbackRoleId), request.message)];
+    : [buildFallbackAssignment(spec, guessFallbackRoleId(spec, request.message, fallbackRoleId), request.message)];
 
   const responseText =
     typeof parsed?.responseText === 'string' && parsed.responseText.trim().length > 0
@@ -413,7 +415,7 @@ export function planWorkspaceTurnHeuristically(
   );
 
   const assignments = request.preferRoleId
-    ? [buildFallbackAssignment(request.preferRoleId, request.message)]
+    ? [buildFallbackAssignment(spec, request.preferRoleId, request.message)]
     : buildHeuristicAssignments(spec, request.message, fallbackRoleId, maxAssignments);
 
   return {
@@ -446,12 +448,12 @@ export function buildWorkflowEntryPlan(
     return planWorkspaceTurnHeuristically(spec, request);
   }
 
-  const entryNode = spec.workflow.nodes.find(node => node.id === spec.workflow?.entryNodeId);
+  const entryNode = getWorkflowEntryNode(spec);
   if (!entryNode) {
     return planWorkspaceTurnHeuristically(spec, request);
   }
 
-  const assignment = buildAssignmentFromWorkflowNode(spec, request, entryNode);
+  const assignment = buildWorkflowDispatchAssignment(spec, request, entryNode);
   if (!assignment) {
     return {
       coordinatorRoleId,
@@ -548,6 +550,10 @@ function buildAssignmentFromClaimResponse(
     (!requestedOutputPath || proposedInstruction.includes(requestedOutputPath))
       ? proposedInstruction
       : request.message.trim();
+  const workflowNode = workflowCandidate && spec.workflow
+    ? spec.workflow.nodes.find(node => node.id === workflowCandidate.nodeId)
+    : undefined;
+  const role = spec.roles.find(value => value.id === response.roleId);
 
   return {
     roleId: response.roleId,
@@ -555,19 +561,29 @@ function buildAssignmentFromClaimResponse(
       response.publicResponse ??
       `Handle workspace request as @${response.roleId}`,
     instruction,
+    ...(workflowNode && role
+      ? {
+          provider: resolveWorkflowNodeProvider(spec, role, workflowNode),
+          model: resolveWorkflowNodeModel(spec, role, workflowNode),
+        }
+      : {}),
     visibility: request.visibility ?? spec.activityPolicy?.defaultVisibility ?? defaultVisibility,
     ...(workflowCandidate ? { workflowNodeId: workflowCandidate.nodeId } : {}),
     ...(workflowCandidate?.stageId ? { stageId: workflowCandidate.stageId } : {}),
   };
 }
 
-function buildAssignmentFromWorkflowNode(
+export function buildWorkflowDispatchAssignment(
   spec: WorkspaceSpec,
   request: WorkspaceTurnRequest,
   node: WorkflowNodeSpec,
 ): WorkspaceTurnAssignment | undefined {
   const roleId = resolveWorkflowNodeRoleId(spec, request.message, node);
   if (!roleId) {
+    return undefined;
+  }
+  const role = spec.roles.find(value => value.id === roleId);
+  if (!role) {
     return undefined;
   }
 
@@ -579,6 +595,8 @@ function buildAssignmentFromWorkflowNode(
   return {
     roleId,
     summary: node.title ? `${node.title} (${node.type})` : `Run workflow node ${node.id}`,
+    provider: resolveWorkflowNodeProvider(spec, role, node),
+    model: resolveWorkflowNodeModel(spec, role, node),
     instruction: [
       `You are executing workflow node "${node.title ?? node.id}" (${node.type}).`,
       node.stageId ? `Current stage: ${node.stageId}.` : null,
@@ -602,6 +620,10 @@ function buildAssignmentFromWorkflowNode(
   };
 }
 
+export function getWorkflowEntryNode(spec: WorkspaceSpec): WorkflowNodeSpec | undefined {
+  return spec.workflow?.nodes.find(node => node.id === spec.workflow?.entryNodeId);
+}
+
 function resolveWorkflowNodeRoleId(
   spec: WorkspaceSpec,
   message: string,
@@ -609,6 +631,12 @@ function resolveWorkflowNodeRoleId(
 ): string | undefined {
   if (node.roleId && spec.roles.some(role => role.id === node.roleId)) {
     return node.roleId;
+  }
+  if (node.workerRoleId && spec.roles.some(role => role.id === node.workerRoleId)) {
+    return node.workerRoleId;
+  }
+  if (node.plannerRoleId && spec.roles.some(role => role.id === node.plannerRoleId)) {
+    return node.plannerRoleId;
   }
   if (node.reviewerRoleId && spec.roles.some(role => role.id === node.reviewerRoleId)) {
     return node.reviewerRoleId;
@@ -809,6 +837,20 @@ function normalizeAssignment(
     instruction,
   };
 
+  const provider = typeof (value as { provider?: unknown }).provider === 'string'
+    ? (value as { provider: string }).provider.trim()
+    : '';
+  if (provider === 'claude-agent-sdk' || provider === 'codex-sdk') {
+    assignment.provider = provider;
+  }
+
+  const model = typeof (value as { model?: unknown }).model === 'string'
+    ? (value as { model: string }).model.trim()
+    : '';
+  if (model) {
+    assignment.model = model;
+  }
+
   const summary = typeof (value as { summary?: unknown }).summary === 'string'
     ? (value as { summary: string }).summary.trim()
     : '';
@@ -834,14 +876,26 @@ function normalizeAssignment(
 }
 
 function buildFallbackAssignment(
+  spec: WorkspaceSpec,
   roleId: string,
   message: string,
   workflowCandidate?: WorkflowCandidate,
 ): WorkspaceTurnAssignment {
+  const workflowNode = workflowCandidate && spec.workflow
+    ? spec.workflow.nodes.find(node => node.id === workflowCandidate.nodeId)
+    : undefined;
+  const role = spec.roles.find(value => value.id === roleId);
+
   return {
     roleId,
     summary: `Handle workspace request as @${roleId}`,
     instruction: message.trim(),
+    ...(workflowNode && role
+      ? {
+          provider: resolveWorkflowNodeProvider(spec, role, workflowNode),
+          model: resolveWorkflowNodeModel(spec, role, workflowNode),
+        }
+      : {}),
     ...(workflowCandidate ? { workflowNodeId: workflowCandidate.nodeId } : {}),
     ...(workflowCandidate?.stageId ? { stageId: workflowCandidate.stageId } : {}),
   };
@@ -861,7 +915,7 @@ function buildHeuristicAssignments(
       if (!roleId || selected.some(entry => entry.roleId === roleId)) {
         continue;
       }
-      selected.push(buildFallbackAssignment(roleId, message, candidate));
+      selected.push(buildFallbackAssignment(spec, roleId, message, candidate));
       if (selected.length >= maxAssignments) {
         return selected;
       }
@@ -882,7 +936,7 @@ function buildHeuristicAssignments(
     .map(entry => entry.roleId);
 
   const finalRoles = selected.length > 0 ? selected : [guessFallbackRoleId(spec, message, fallbackRoleId)];
-  return Array.from(new Set(finalRoles)).map(roleId => buildFallbackAssignment(roleId, message));
+  return Array.from(new Set(finalRoles)).map(roleId => buildFallbackAssignment(spec, roleId, message));
 }
 
 function guessFallbackRoleId(
@@ -955,7 +1009,13 @@ function resolveWorkflowCandidates(
   for (const node of spec.workflow.nodes) {
       const roleIds = Array.from(
         new Set(
-          [node.roleId, node.reviewerRoleId, ...(node.candidateRoleIds ?? [])].filter(
+          [
+            node.roleId,
+            node.workerRoleId,
+            node.plannerRoleId,
+            node.reviewerRoleId,
+            ...(node.candidateRoleIds ?? []),
+          ].filter(
             (value): value is string => Boolean(value),
           ),
         ),
@@ -1019,6 +1079,8 @@ function workflowNodePriority(nodeType: WorkflowNodeType): number {
     case 'assign':
       return 6;
     case 'review':
+      return 5;
+    case 'worklist':
       return 5;
     case 'shell':
       return 4;

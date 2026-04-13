@@ -5,6 +5,7 @@ export function createAutoresearchTemplate(): WorkspaceTemplate {
     templateId: 'autoresearch',
     templateName: 'Autoresearch',
     description: 'A research-oriented workspace for scouting and synthesis.',
+    provider: 'claude-agent-sdk',
     defaultRoleId: 'lead',
     coordinatorRoleId: 'lead',
     orchestratorPrompt:

@@ -5,6 +5,7 @@ export function createOpcSoloCompanyTemplate(): WorkspaceTemplate {
     templateId: 'opc-solo-company',
     templateName: 'OPC Solo Company',
     description: 'A one-person company staffed by specialist digital operators.',
+    provider: 'claude-agent-sdk',
     defaultRoleId: 'ceo',
     coordinatorRoleId: 'ceo',
     orchestratorPrompt:

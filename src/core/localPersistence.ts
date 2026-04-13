@@ -2,9 +2,10 @@ import { access, appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 
 import type { WorkspaceEvent } from './events.js';
+import { resolveRoleModel, resolveRoleProvider } from './providerResolution.js';
 import type {
-  MultiAgentProvider,
   RoleSpec,
+  WorkspaceProvider,
   WorkspaceSpec,
   WorkspaceState,
 } from './types.js';
@@ -20,7 +21,7 @@ export interface PersistedProviderBinding {
 
 export interface PersistedProviderState {
   workspaceId: string;
-  provider: MultiAgentProvider;
+  provider: WorkspaceProvider;
   rootConversationId?: string;
   memberBindings: Record<string, PersistedProviderBinding>;
   metadata?: Record<string, unknown>;
@@ -196,9 +197,15 @@ function renderAgentMarkdown(spec: WorkspaceSpec, role: RoleSpec): string {
     lines.push('');
   }
 
-  if (role.agent.model) {
+  if (role.agent.model || spec.defaultModel || spec.model || spec.provider !== 'hybrid') {
     lines.push('## Model');
-    lines.push(role.agent.model);
+    lines.push(resolveRoleModel(spec, role));
+    lines.push('');
+  }
+
+  if (role.agent.provider || spec.defaultProvider || spec.provider !== 'hybrid') {
+    lines.push('## Provider');
+    lines.push(resolveRoleProvider(spec, role));
     lines.push('');
   }
 
