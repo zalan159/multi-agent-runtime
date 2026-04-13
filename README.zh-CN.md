@@ -197,8 +197,16 @@ await workspace.close();
 - 对外仍然呈现为一个 workspace 的统一事件流
 
 使用上有两个关键点：
-- `spec.provider = 'hybrid'`
-- 每个角色都显式声明 `role.agent.provider`
+- 最终解析出来的 provider 至少有两种
+- 只有 role 或 workflow node 偏离 workspace 默认 provider 时，才需要显式写 `provider`
+
+现在的解析顺序是：
+- template 级默认 provider/model
+- profile 对 template 默认值的覆盖
+- role 级 provider/model 覆盖
+- workflow node 级 provider/model 覆盖
+
+如果最终解析出来的 provider 不止一种，`instantiateWorkspace()` 会自动把 `spec.provider` 推断成 `hybrid`。
 
 仓库里现在已经有一个参考 TypeScript 示例：[`src/examples/hybridClaudeCodex.ts`](./src/examples/hybridClaudeCodex.ts)，可以这样跑：
 
@@ -270,6 +278,7 @@ npm run smoke:hybrid -- /absolute/workspace/path "你的任务描述"
 - 编码循环：`claim -> prd -> review -> architecture -> implement -> test -> review -> complete`
 - autoresearch 循环：`frame -> claim evidence -> shell run -> evaluate -> keep/discard -> loop`
 - 三省六部治理流：`draft -> review -> dispatch -> execute -> compliance -> final review`
+- workflow node 现在也可以按需覆盖 provider/model
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`

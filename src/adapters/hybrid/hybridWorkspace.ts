@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
-import type { WorkspaceEvent, WorkspaceInitializedEvent, WorkspaceMessageEvent } from '../../core/events.js';
+import type { WorkspaceEvent, WorkspaceInitializedEvent, WorkspaceMessageEvent, WorkflowStageEvent } from '../../core/events.js';
+import {
+  resolveDispatchTarget,
+  resolveRoleProvider,
+  resolveWorkspaceDefaultModel,
+} from '../../core/providerResolution.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
   ClaimStatus,
@@ -19,23 +24,19 @@ import type {
   WorkspaceTurnRequest,
   WorkspaceTurnResult,
   WorkspaceVisibility,
+  WorkflowWorklistRuntimeState,
   WorkspaceWorkflowVoteResponse,
   WorkspaceWorkflowVoteWindow,
 } from '../../core/types.js';
 import {
-  buildCoordinatorDecisionPrompt,
   buildPlanFromClaimResponses,
   buildWorkflowEntryPlan,
-  buildWorkflowVotePrompt,
-  buildWorkspaceClaimPrompt,
-  parseCoordinatorDecision,
-  parseWorkflowVoteResponse,
-  parseWorkspaceClaimResponse,
   planWorkspaceTurnHeuristically,
   resolveClaimCandidateRoleIds,
   resolveWorkflowVoteCandidateRoleIds,
   shouldApproveWorkflowVote,
 } from '../../core/workspaceTurn.js';
+import { executeWorkflow } from '../../core/workflowExecution.js';
 import { ClaudeAgentWorkspace, type ClaudeAgentWorkspaceOptions } from '../claude/claudeAgentWorkspace.js';
 import { CodexSdkWorkspace, type CodexSdkWorkspaceOptions } from '../codex/codexSdkWorkspace.js';
 
@@ -79,7 +80,7 @@ export class HybridWorkspace extends WorkspaceRuntime {
             workspaceId: this.spec.id,
             roleId: role.id,
             roleName: role.name,
-            provider: this.resolveRoleProvider(role),
+            provider: resolveRoleProvider(this.spec, role),
             ...(role.direct !== undefined ? { direct: role.direct } : {}),
             status: 'idle',
           } satisfies WorkspaceMember,
@@ -176,9 +177,14 @@ export class HybridWorkspace extends WorkspaceRuntime {
       throw new Error(`Unknown role: ${request.roleId}`);
     }
 
-    const provider = this.resolveRoleProvider(role);
+    const target = resolveDispatchTarget(this.spec, role, request);
+    const provider = target.provider;
     const child = this.getChildWorkspace(provider);
-    const dispatch = await child.assignRoleTask(request);
+    const dispatch = await child.assignRoleTask({
+      ...request,
+      provider: target.provider,
+      model: target.model,
+    });
     return this.toTopLevelDispatch(dispatch, provider);
   }
 
@@ -197,26 +203,15 @@ export class HybridWorkspace extends WorkspaceRuntime {
     await this.send(request.message, request.visibility ?? 'public');
 
     const coordinatorRole = this.resolveCoordinatorRole();
-    const coordinatorDispatch = await this.runRoleTask(
-      {
-        roleId: coordinatorRole.id,
-        summary: 'Route workspace turn',
-        visibility: 'coordinator',
-        instruction: buildCoordinatorDecisionPrompt(this.spec, request),
-      },
-      options,
-    );
-    const coordinatorDecision = parseCoordinatorDecision(
-      coordinatorDispatch.resultText ?? coordinatorDispatch.lastSummary ?? '',
-      this.spec,
+    const coordinatorDecision = await this.requestCoordinatorDecision(
       request,
+      options.timeoutMs,
     );
     this.emitCoordinatorSummary(coordinatorDecision.responseText, coordinatorRole.id);
 
     if (coordinatorDecision.kind === 'respond') {
       return {
         request,
-        coordinatorDispatch,
         plan: {
           coordinatorRoleId: coordinatorRole.id,
           responseText: coordinatorDecision.responseText,
@@ -252,7 +247,6 @@ export class HybridWorkspace extends WorkspaceRuntime {
       if (!shouldRunWorkflow) {
         return {
           request,
-          coordinatorDispatch,
           workflowVoteWindow,
           workflowVoteResponses,
           plan: {
@@ -307,14 +301,46 @@ export class HybridWorkspace extends WorkspaceRuntime {
       );
     }
 
+    const dispatches = shouldRunWorkflow
+      ? await this.executeWorkflowTurn(effectiveRequest, coordinatorRole.id, options)
+      : await this.executePlannedAssignments(
+          plan.assignments,
+          request,
+          coordinatorRole.id,
+          claimResponses,
+          options,
+        );
+
+    return {
+      request,
+      ...(claimWindow ? { claimWindow } : {}),
+      ...(claimResponses ? { claimResponses } : {}),
+      ...(workflowVoteWindow ? { workflowVoteWindow } : {}),
+      ...(workflowVoteResponses ? { workflowVoteResponses } : {}),
+      plan,
+      dispatches,
+    };
+  }
+
+  private async executePlannedAssignments(
+    assignments: WorkspaceTurnResult['plan']['assignments'],
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    claimResponses: WorkspaceClaimResponse[] | undefined,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
     const dispatches: TaskDispatch[] = [];
-    for (const assignment of plan.assignments) {
+    for (const assignment of assignments) {
       const dispatch = await this.assignRoleTask({
         roleId: assignment.roleId,
         instruction: assignment.instruction,
         ...(assignment.summary ? { summary: assignment.summary } : {}),
+        ...(assignment.provider ? { provider: assignment.provider } : {}),
+        ...(assignment.model ? { model: assignment.model } : {}),
         visibility: assignment.visibility ?? request.visibility ?? 'public',
-        sourceRoleId: coordinatorRole.id,
+        sourceRoleId: coordinatorRoleId,
+        ...(assignment.workflowNodeId ? { workflowNodeId: assignment.workflowNodeId } : {}),
+        ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
       });
       const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
       this.claimDispatch(
@@ -323,21 +349,50 @@ export class HybridWorkspace extends WorkspaceRuntime {
         claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
         claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
       );
-      dispatches.push(
-        await this.runDispatch(Promise.resolve(dispatch), options),
-      );
+      dispatches.push(await this.runDispatch(Promise.resolve(dispatch), options));
     }
+    return dispatches;
+  }
 
-    return {
+  private async executeWorkflowTurn(
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
+    const result = await executeWorkflow(
+      this.spec,
       request,
-      coordinatorDispatch,
-      ...(claimWindow ? { claimWindow } : {}),
-      ...(claimResponses ? { claimResponses } : {}),
-      ...(workflowVoteWindow ? { workflowVoteWindow } : {}),
-      ...(workflowVoteResponses ? { workflowVoteResponses } : {}),
-      plan,
-      dispatches,
-    };
+      async (assignment, node) => {
+        const dispatch = await this.assignRoleTask({
+          roleId: assignment.roleId,
+          instruction: assignment.instruction,
+          ...(assignment.summary ? { summary: assignment.summary } : {}),
+          ...(assignment.provider ? { provider: assignment.provider } : {}),
+          ...(assignment.model ? { model: assignment.model } : {}),
+          visibility: assignment.visibility ?? request.visibility ?? 'public',
+          sourceRoleId: coordinatorRoleId,
+          workflowNodeId: node.id,
+          ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
+          ...(assignment.workItemId ? { workItemId: assignment.workItemId } : {}),
+        });
+        this.claimDispatch(
+          dispatch.dispatchId,
+          assignment.roleId,
+          `Claimed workflow node "${node.title ?? node.id}".`,
+          'claimed',
+        );
+        return this.runDispatch(Promise.resolve(dispatch), options);
+      },
+      {
+        onNodeStarted: node => this.enterWorkflowNode(node),
+        onStageStarted: (stageId, node) => this.emitWorkflowStageStarted(stageId, node),
+        onStageCompleted: (stageId, node) => this.emitWorkflowStageCompleted(stageId, node),
+        onWorklistUpdated: (node, worklist) => this.updateWorklistState(node.id, worklist),
+        onCompleted: (workflowResult, lastNode) => this.finishWorkflowExecution(workflowResult.completionStatus, lastNode),
+      },
+    );
+
+    return result.dispatches;
   }
 
   async deleteWorkspace(): Promise<void> {
@@ -370,18 +425,14 @@ export class HybridWorkspace extends WorkspaceRuntime {
     }
 
     for (const role of this.spec.roles) {
-      if (!role.agent.provider) {
-        throw new Error(
-          `Role "${role.id}" is missing agent.provider. Hybrid workspaces require provider per role.`,
-        );
-      }
+      resolveRoleProvider(this.spec, role);
     }
   }
 
   private groupRolesByProvider(): Map<MultiAgentProvider, RoleSpec[]> {
     const map = new Map<MultiAgentProvider, RoleSpec[]>();
     for (const role of this.spec.roles) {
-      const provider = this.resolveRoleProvider(role);
+      const provider = resolveRoleProvider(this.spec, role);
       const bucket = map.get(provider) ?? [];
       bucket.push(role);
       map.set(provider, bucket);
@@ -405,6 +456,8 @@ export class HybridWorkspace extends WorkspaceRuntime {
       ...this.spec,
       id: `${this.spec.id}--${provider === 'claude-agent-sdk' ? 'claude' : 'codex'}`,
       provider,
+      defaultProvider: provider,
+      defaultModel,
       model: defaultModel,
       roles,
       ...(defaultRoleId ? { defaultRoleId } : {}),
@@ -427,7 +480,11 @@ export class HybridWorkspace extends WorkspaceRuntime {
 
   private resolveDefaultModel(provider: MultiAgentProvider, roles: RoleSpec[]): string {
     const explicitRoleModel = roles.find(role => role.agent.model)?.agent.model;
-    const defaultModel = this.defaultModels[provider] ?? explicitRoleModel;
+    const defaultModel =
+      this.defaultModels[provider] ??
+      (this.spec.defaultProvider === provider ? this.spec.defaultModel ?? this.spec.model : undefined) ??
+      explicitRoleModel ??
+      resolveWorkspaceDefaultModel(this.spec, provider);
     if (!defaultModel) {
       throw new Error(
         `No model configured for ${provider}. Set role.agent.model or HybridWorkspace defaultModels.`,
@@ -435,15 +492,6 @@ export class HybridWorkspace extends WorkspaceRuntime {
     }
     return defaultModel;
   }
-
-  private resolveRoleProvider(role: RoleSpec): MultiAgentProvider {
-    if (role.agent.provider) {
-      return role.agent.provider;
-    }
-
-    throw new Error(`Role "${role.id}" does not declare a provider.`);
-  }
-
   private resolveCoordinatorRole(): RoleSpec {
     const coordinatorRoleId =
       this.spec.coordinatorRoleId ?? this.spec.defaultRoleId ?? this.spec.roles[0]?.id;
@@ -455,6 +503,37 @@ export class HybridWorkspace extends WorkspaceRuntime {
       throw new Error(`Unknown coordinator role: ${coordinatorRoleId}`);
     }
     return coordinatorRole;
+  }
+
+  private async requestCoordinatorDecision(
+    request: WorkspaceTurnRequest,
+    timeoutMs = 120_000,
+  ): Promise<CoordinatorWorkflowDecision> {
+    const coordinatorRole = this.resolveCoordinatorRole();
+    const provider = resolveRoleProvider(this.spec, coordinatorRole);
+    const child = this.getChildWorkspace(provider);
+    return child.requestCoordinatorDecision(request, timeoutMs);
+  }
+
+  private async probeRoleClaim(
+    role: RoleSpec,
+    request: WorkspaceTurnRequest,
+    timeoutMs: number,
+  ): Promise<WorkspaceClaimResponse> {
+    const provider = resolveRoleProvider(this.spec, role);
+    const child = this.getChildWorkspace(provider);
+    return child.probeRoleClaim(role, request, timeoutMs);
+  }
+
+  private async probeWorkflowVote(
+    role: RoleSpec,
+    request: WorkspaceTurnRequest,
+    coordinatorDecision: CoordinatorWorkflowDecision,
+    timeoutMs: number,
+  ): Promise<WorkspaceWorkflowVoteResponse> {
+    const provider = resolveRoleProvider(this.spec, role);
+    const child = this.getChildWorkspace(provider);
+    return child.probeWorkflowVote(role, request, coordinatorDecision, timeoutMs);
   }
 
   private getChildWorkspace(provider: MultiAgentProvider): ChildWorkspace {
@@ -741,20 +820,7 @@ export class HybridWorkspace extends WorkspaceRuntime {
           return response;
         }
         try {
-          const dispatch = await this.runRoleTask(
-            {
-              roleId: role.id,
-              summary: 'Claim probe',
-              visibility: 'coordinator',
-              instruction: buildWorkspaceClaimPrompt(this.spec, role, request),
-            },
-            { timeoutMs: claimProbeTimeout, resultTimeoutMs: 10_000 },
-          );
-          const response = parseWorkspaceClaimResponse(
-            dispatch.resultText ?? dispatch.lastSummary ?? '',
-            role,
-            request,
-          );
+          const response = await this.probeRoleClaim(role, request, claimProbeTimeout);
           this.emitClaimResponse(claimWindow, response);
           return response;
         } catch {
@@ -856,26 +922,11 @@ export class HybridWorkspace extends WorkspaceRuntime {
           return response;
         }
         try {
-          const dispatch = await this.runRoleTask(
-            {
-              roleId: role.id,
-              summary: 'Workflow vote',
-              visibility: 'coordinator',
-              instruction: buildWorkflowVotePrompt(
-                this.spec,
-                role,
-                request,
-                coordinatorDecision,
-              ),
-            },
-            { timeoutMs: voteTimeout, resultTimeoutMs: 10_000 },
-          );
-          const response = parseWorkflowVoteResponse(
-            dispatch.resultText ?? dispatch.lastSummary ?? '',
+          const response = await this.probeWorkflowVote(
             role,
-            this.spec,
             request,
             coordinatorDecision,
+            voteTimeout,
           );
           this.emitWorkflowVoteResponse(voteWindow, response);
           return response;
@@ -943,6 +994,74 @@ export class HybridWorkspace extends WorkspaceRuntime {
       roleId: this.resolveCoordinatorRole().id,
       visibility: 'public',
     });
+  }
+
+  private enterWorkflowNode(node: { id: string; stageId?: string; title?: string }): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      mode: 'workflow_running',
+      activeNodeId: node.id,
+      ...(node.stageId ? { activeStageId: node.stageId } : {}),
+    };
+  }
+
+  private emitWorkflowStageStarted(stageId: string, node: { id: string; roleId?: string; reviewerRoleId?: string }): void {
+    this.emitLocalEvent({
+      type: 'workflow.stage.started',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    } satisfies WorkflowStageEvent);
+    this.publishActivity('workflow_stage_started', `Workflow stage started: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private emitWorkflowStageCompleted(stageId: string, node: { id: string; roleId?: string; reviewerRoleId?: string }): void {
+    this.emitLocalEvent({
+      type: 'workflow.stage.completed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    } satisfies WorkflowStageEvent);
+    this.publishActivity('workflow_stage_completed', `Workflow stage completed: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private finishWorkflowExecution(
+    status: 'done' | 'stuck' | 'discarded' | 'crash',
+    lastNode?: { id: string; title?: string; stageId?: string },
+  ): void {
+    this.state.workflowRuntime = {
+      mode: 'group_chat',
+      ...(this.state.workflowRuntime.worklists
+        ? { worklists: { ...this.state.workflowRuntime.worklists } }
+        : {}),
+    };
+    this.publishActivity(
+      'workflow_completed',
+      `Workflow ${status} at ${lastNode?.title ?? lastNode?.id ?? 'unknown node'}.`,
+      {
+        visibility: 'public',
+      },
+    );
+  }
+
+  private updateWorklistState(nodeId: string, worklist: WorkflowWorklistRuntimeState): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      worklists: {
+        ...(this.state.workflowRuntime.worklists ?? {}),
+        [nodeId]: worklist,
+      },
+    };
   }
 
   private claimDispatch(

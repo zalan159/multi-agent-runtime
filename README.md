@@ -197,8 +197,16 @@ Use this when you want one workspace where:
 - the event stream still looks like one workspace
 
 The key requirement is:
-- set `spec.provider = 'hybrid'`
-- set `role.agent.provider` on every role
+- run a spec whose resolved providers span more than one provider
+- set explicit `provider` only where a role or workflow node differs from the workspace default
+
+Resolution order is now:
+- template-level default provider/model
+- profile-level override of the template default
+- role-level provider/model override
+- workflow-node-level provider/model override for dispatches created from that node
+
+If the final resolved providers span more than one provider, `instantiateWorkspace()` now infers `spec.provider = 'hybrid'`.
 
 There is a reference TypeScript example at [`src/examples/hybridClaudeCodex.ts`](./src/examples/hybridClaudeCodex.ts), runnable with:
 
@@ -270,6 +278,7 @@ That lets us express patterns such as:
 - coding loop: `claim -> prd -> review -> architecture -> implement -> test -> review -> complete`
 - autoresearch loop: `frame -> claim evidence -> shell run -> evaluate -> keep/discard -> loop`
 - governance flow: `draft -> review -> dispatch -> execute -> compliance -> final review`
+- workflow nodes may now optionally override provider/model for the role they dispatch
 - `dispatch.queued`
 - `dispatch.started`
 - `dispatch.progress`

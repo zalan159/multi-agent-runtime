@@ -14,6 +14,7 @@ export type WorkflowNodeType =
   | 'announce'
   | 'assign'
   | 'claim'
+  | 'worklist'
   | 'shell'
   | 'evaluate'
   | 'review'
@@ -122,9 +123,76 @@ export interface WorkflowRetryPolicy {
   maxAttempts?: number;
 }
 
+export type WorkflowArtifactKind =
+  | 'doc'
+  | 'code'
+  | 'report'
+  | 'metric'
+  | 'evidence'
+  | 'result'
+  | 'task_order'
+  | 'task_list'
+  | 'ledger';
+
+export type WorkflowWorkItemStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'discarded';
+
+export type WorkflowWorklistMode = 'finite' | 'replenishing';
+
+export interface WorkflowWorkItem {
+  id: string;
+  title: string;
+  description: string;
+  status?: WorkflowWorkItemStatus;
+  attempts?: number;
+  maxAttempts?: number;
+  dependsOn?: string[];
+  goalsFile?: string;
+  referenceFiles?: string[];
+  files?: string[];
+  acceptanceCriteria?: string[];
+  metadata?: Record<string, string | number | boolean | null>;
+}
+
+export interface WorkflowTaskListArtifact {
+  version: 1;
+  mode?: WorkflowWorklistMode;
+  summary?: string;
+  items: WorkflowWorkItem[];
+}
+
+export interface WorkflowWorklistRuntimeItemState {
+  itemId: string;
+  title: string;
+  status: WorkflowWorkItemStatus;
+  attempts: number;
+  maxAttempts?: number;
+  dispatchId?: string;
+  lastSummary?: string;
+  updatedAt: string;
+}
+
+export interface WorkflowWorklistRuntimeState {
+  nodeId: string;
+  artifactId: string;
+  mode: WorkflowWorklistMode;
+  plannerRoleId?: string;
+  workerRoleId: string;
+  batchCount: number;
+  completedItemIds: string[];
+  failedItemIds: string[];
+  items: Record<string, WorkflowWorklistRuntimeItemState>;
+  lastUpdatedAt: string;
+}
+
 export interface WorkflowArtifactSpec {
   id: string;
-  kind: 'doc' | 'code' | 'report' | 'metric' | 'evidence' | 'result' | 'task_order';
+  kind: WorkflowArtifactKind;
   path: string;
   ownerRoleId?: string;
   required?: boolean;
@@ -143,12 +211,23 @@ export interface WorkflowNodeSpec {
   id: string;
   type: WorkflowNodeType;
   title?: string;
+  provider?: MultiAgentProvider;
+  model?: string;
   roleId?: string;
   reviewerRoleId?: string;
   candidateRoleIds?: string[];
   command?: string;
   evaluator?: string;
   prompt?: string;
+  worklistArtifactId?: string;
+  workerRoleId?: string;
+  plannerRoleId?: string;
+  plannerPrompt?: string;
+  worklistMode?: WorkflowWorklistMode;
+  replenish?: 'never' | 'when_empty';
+  maxBatches?: number;
+  stopOnItemFailure?: boolean;
+  itemPromptTemplate?: string;
   timeoutMs?: number;
   retry?: WorkflowRetryPolicy;
   requiresArtifacts?: string[];
@@ -182,7 +261,9 @@ export interface WorkspaceSpec {
   id: string;
   name: string;
   provider: WorkspaceProvider;
-  model: string;
+  model?: string;
+  defaultProvider?: MultiAgentProvider;
+  defaultModel?: string;
   cwd?: string;
   orchestratorPrompt?: string;
   allowedTools?: string[];
@@ -204,8 +285,13 @@ export interface RoleTaskRequest {
   roleId: string;
   instruction: string;
   summary?: string;
+  provider?: MultiAgentProvider;
+  model?: string;
   visibility?: WorkspaceVisibility;
   sourceRoleId?: string;
+  workflowNodeId?: string;
+  stageId?: string;
+  workItemId?: string;
 }
 
 export interface WorkspaceTurnRequest {
@@ -259,9 +345,12 @@ export interface WorkspaceTurnAssignment {
   roleId: string;
   instruction: string;
   summary?: string;
+  provider?: MultiAgentProvider;
+  model?: string;
   visibility?: WorkspaceVisibility;
   workflowNodeId?: string;
   stageId?: string;
+  workItemId?: string;
 }
 
 export interface WorkspaceTurnPlan {
@@ -287,10 +376,14 @@ export interface TaskDispatch {
   workspaceId: string;
   roleId: string;
   provider?: MultiAgentProvider;
+  model?: string;
   instruction: string;
   summary?: string;
   visibility?: WorkspaceVisibility;
   sourceRoleId?: string;
+  workflowNodeId?: string;
+  stageId?: string;
+  workItemId?: string;
   status: 'queued' | 'started' | 'running' | 'completed' | 'failed' | 'stopped';
   providerTaskId?: string;
   toolUseId?: string;
@@ -335,6 +428,7 @@ export interface WorkspaceWorkflowRuntimeState {
   activeVoteWindow?: WorkspaceWorkflowVoteWindow;
   activeNodeId?: string;
   activeStageId?: string;
+  worklists?: Record<string, WorkflowWorklistRuntimeState>;
 }
 
 export interface WorkspaceState {

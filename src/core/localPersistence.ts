@@ -2,6 +2,7 @@ import { access, appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 
 import type { WorkspaceEvent } from './events.js';
+import { resolveRoleModel, resolveRoleProvider } from './providerResolution.js';
 import type {
   RoleSpec,
   WorkspaceProvider,
@@ -196,15 +197,15 @@ function renderAgentMarkdown(spec: WorkspaceSpec, role: RoleSpec): string {
     lines.push('');
   }
 
-  if (role.agent.model) {
+  if (role.agent.model || spec.defaultModel || spec.model || spec.provider !== 'hybrid') {
     lines.push('## Model');
-    lines.push(role.agent.model);
+    lines.push(resolveRoleModel(spec, role));
     lines.push('');
   }
 
-  if (role.agent.provider) {
+  if (role.agent.provider || spec.defaultProvider || spec.provider !== 'hybrid') {
     lines.push('## Provider');
-    lines.push(role.agent.provider);
+    lines.push(resolveRoleProvider(spec, role));
     lines.push('');
   }
 

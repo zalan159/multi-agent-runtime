@@ -106,7 +106,9 @@ async function main(): Promise<void> {
     id: `hybrid-claude-codex-${Date.now()}`,
     name: 'Hybrid Claude + Codex Workspace',
     provider: 'hybrid',
-    model: 'hybrid',
+    defaultProvider: 'claude-agent-sdk',
+    defaultModel: claudeModel,
+    model: claudeModel,
     cwd,
     roles: [
       {
@@ -114,7 +116,6 @@ async function main(): Promise<void> {
         name: 'Planner',
         outputRoot: '00-management/',
         agent: {
-          provider: 'claude-agent-sdk',
           description: 'Creates plans and implementation briefs.',
           prompt:
             'You are a planning lead. Break work into a concise execution plan, write explicit acceptance criteria, and leave implementation details to downstream coding agents.',
@@ -126,7 +127,6 @@ async function main(): Promise<void> {
         name: 'Tracker',
         outputRoot: '00-management/',
         agent: {
-          provider: 'claude-agent-sdk',
           description: 'Maintains concise progress status and executive overviews.',
           prompt:
             'You are a delivery tracker. Keep status up to date, summarize progress crisply, call out blockers early, and maintain a concise executive view of the run.',
@@ -139,6 +139,7 @@ async function main(): Promise<void> {
         outputRoot: '40-code/',
         agent: {
           provider: 'codex-sdk',
+          model: codexModel,
           description: 'Implements code changes with focused diffs.',
           prompt:
             'You are an implementation specialist. Follow the approved plan, make focused code changes, and explain assumptions briefly when the repository leaves gaps.',
@@ -151,6 +152,7 @@ async function main(): Promise<void> {
         outputRoot: '50-test/',
         agent: {
           provider: 'codex-sdk',
+          model: codexModel,
           description: 'Validates changes and records residual risk.',
           prompt:
             'You are a verification specialist. Prefer the narrowest useful checks first, report failures clearly, and document residual risks when full validation is not possible.',

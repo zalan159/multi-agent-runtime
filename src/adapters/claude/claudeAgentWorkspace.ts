@@ -26,6 +26,7 @@ import type {
   MemberRegisteredEvent,
   MemberStateChangedEvent,
   WorkflowStartedEvent,
+  WorkflowStageEvent,
   WorkflowVoteResponseEvent,
   WorkflowVoteWindowClosedEvent,
   WorkflowVoteWindowOpenedEvent,
@@ -38,6 +39,14 @@ import {
   type PersistedProviderState,
   LocalWorkspacePersistence,
 } from '../../core/localPersistence.js';
+import {
+  resolveDispatchTarget,
+  resolveRoleModel,
+  resolveRoleProvider,
+  resolveWorkflowNodeModel,
+  resolveWorkflowNodeProvider,
+  resolveWorkspaceDefaultModel,
+} from '../../core/providerResolution.js';
 import { WorkspaceRuntime } from '../../core/runtime.js';
 import type {
   ClaimStatus,
@@ -55,6 +64,7 @@ import type {
   WorkspaceTurnRequest,
   WorkspaceTurnResult,
   WorkspaceVisibility,
+  WorkflowWorklistRuntimeState,
   WorkspaceWorkflowVoteResponse,
   WorkspaceWorkflowVoteWindow,
 } from '../../core/types.js';
@@ -74,6 +84,7 @@ import {
   resolveWorkflowVoteCandidateRoleIds,
   shouldApproveWorkflowVote,
 } from '../../core/workspaceTurn.js';
+import { executeWorkflow } from '../../core/workflowExecution.js';
 import { AsyncMessageQueue } from './asyncMessageQueue.js';
 import { extractMessageText, normalizeAgentNames } from './messageUtils.js';
 
@@ -238,17 +249,28 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     if (!role) {
       throw new Error(`Unknown role: ${request.roleId}`);
     }
+    const target = resolveDispatchTarget(this.spec, role, request);
+    if (target.provider !== 'claude-agent-sdk') {
+      throw new Error(
+        `ClaudeAgentWorkspace cannot execute provider "${target.provider}" for role "${role.id}".`,
+      );
+    }
 
     const dispatch: TaskDispatch = {
       dispatchId: randomUUID(),
       workspaceId: this.spec.id,
       roleId: role.id,
+      provider: target.provider,
+      model: target.model,
       instruction: request.instruction,
       status: 'queued',
       createdAt: new Date().toISOString(),
       ...(request.summary ? { summary: request.summary } : {}),
       ...(request.visibility ? { visibility: request.visibility } : {}),
       ...(request.sourceRoleId ? { sourceRoleId: request.sourceRoleId } : {}),
+      ...(request.workflowNodeId ? { workflowNodeId: request.workflowNodeId } : {}),
+      ...(request.stageId ? { stageId: request.stageId } : {}),
+      ...(request.workItemId ? { workItemId: request.workItemId } : {}),
       ...(this.spec.claimPolicy?.mode !== 'claim'
         ? {
             claimStatus: 'claimed' satisfies ClaimStatus,
@@ -402,26 +424,15 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       );
     }
 
-    const dispatches: TaskDispatch[] = [];
-    for (const assignment of plan.assignments) {
-      const dispatch = await this.assignRoleTask({
-        roleId: assignment.roleId,
-        instruction: assignment.instruction,
-        ...(assignment.summary ? { summary: assignment.summary } : {}),
-        visibility: assignment.visibility ?? request.visibility ?? 'public',
-        sourceRoleId: coordinatorRole.id,
-      });
-      const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
-      this.claimDispatch(
-        dispatch.dispatchId,
-        assignment.roleId,
-        claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
-        claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
-      );
-      dispatches.push(
-        await this.runDispatch(Promise.resolve(dispatch), options),
-      );
-    }
+    const dispatches = shouldRunWorkflow
+      ? await this.executeWorkflowTurn(effectiveRequest, coordinatorRole.id, options)
+      : await this.executePlannedAssignments(
+          plan.assignments,
+          request,
+          coordinatorRole.id,
+          claimResponses,
+          options,
+        );
 
     return {
       request,
@@ -432,6 +443,80 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       plan,
       dispatches,
     };
+  }
+
+  private async executePlannedAssignments(
+    assignments: WorkspaceTurnResult['plan']['assignments'],
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    claimResponses: WorkspaceClaimResponse[] | undefined,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
+    const dispatches: TaskDispatch[] = [];
+    for (const assignment of assignments) {
+      const dispatch = await this.assignRoleTask({
+        roleId: assignment.roleId,
+        instruction: assignment.instruction,
+        ...(assignment.summary ? { summary: assignment.summary } : {}),
+        ...(assignment.provider ? { provider: assignment.provider } : {}),
+        ...(assignment.model ? { model: assignment.model } : {}),
+        visibility: assignment.visibility ?? request.visibility ?? 'public',
+        sourceRoleId: coordinatorRoleId,
+        ...(assignment.workflowNodeId ? { workflowNodeId: assignment.workflowNodeId } : {}),
+        ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
+      });
+      const claimResponse = claimResponses?.find(response => response.roleId === assignment.roleId);
+      this.claimDispatch(
+        dispatch.dispatchId,
+        assignment.roleId,
+        claimResponse?.publicResponse ?? claimResponse?.rationale ?? 'Claimed by runtime routing',
+        claimResponse?.decision === 'support' ? 'supporting' : 'claimed',
+      );
+      dispatches.push(await this.runDispatch(Promise.resolve(dispatch), options));
+    }
+    return dispatches;
+  }
+
+  private async executeWorkflowTurn(
+    request: WorkspaceTurnRequest,
+    coordinatorRoleId: string,
+    options: { timeoutMs?: number; resultTimeoutMs?: number },
+  ): Promise<TaskDispatch[]> {
+    const result = await executeWorkflow(
+      this.spec,
+      request,
+      async (assignment, node) => {
+        const dispatch = await this.assignRoleTask({
+          roleId: assignment.roleId,
+          instruction: assignment.instruction,
+          ...(assignment.summary ? { summary: assignment.summary } : {}),
+          ...(assignment.provider ? { provider: assignment.provider } : {}),
+          ...(assignment.model ? { model: assignment.model } : {}),
+          visibility: assignment.visibility ?? request.visibility ?? 'public',
+          sourceRoleId: coordinatorRoleId,
+          workflowNodeId: node.id,
+          ...(assignment.stageId ? { stageId: assignment.stageId } : {}),
+          ...(assignment.workItemId ? { workItemId: assignment.workItemId } : {}),
+        });
+        this.claimDispatch(
+          dispatch.dispatchId,
+          assignment.roleId,
+          `Claimed workflow node "${node.title ?? node.id}".`,
+          'claimed',
+        );
+        return this.runDispatch(Promise.resolve(dispatch), options);
+      },
+      {
+        onNodeStarted: node => this.enterWorkflowNode(node),
+        onStageStarted: (stageId, node) => this.emitWorkflowStageStarted(stageId, node),
+        onStageCompleted: (stageId, node) => this.emitWorkflowStageCompleted(stageId, node),
+        onWorklistUpdated: (node, worklist) => this.updateWorklistState(node.id, worklist),
+        onCompleted: (workflowResult, lastNode) =>
+          this.finishWorkflowExecution(workflowResult.completionStatus, lastNode),
+      },
+    );
+
+    return result.dispatches;
   }
 
   async deleteWorkspace(): Promise<void> {
@@ -483,7 +568,10 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     );
 
     const options: ClaudeOptions = {
-      model: this.spec.model,
+      model: resolveWorkspaceDefaultModel(
+        this.spec,
+        resolveRoleProvider(this.spec, this.resolveCoordinatorRole()),
+      ),
       allowedTools,
       tools: {
         type: 'preset',
@@ -513,12 +601,48 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
   }
 
   private buildAgents(): Record<string, AgentDefinition> {
-    return Object.fromEntries(
+    const agents = new Map<string, AgentDefinition>(
       this.spec.roles.map(role => [role.id, this.toClaudeAgentDefinition(role)]),
     );
+
+    for (const node of this.spec.workflow?.nodes ?? []) {
+      const roleIds = [
+        node.roleId,
+        node.reviewerRoleId,
+        ...(node.candidateRoleIds ?? []),
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+
+      for (const roleId of roleIds) {
+        const role = this.state.roles[roleId];
+        if (!role) {
+          continue;
+        }
+
+        const provider = resolveWorkflowNodeProvider(this.spec, role, node);
+        if (provider !== 'claude-agent-sdk') {
+          continue;
+        }
+
+        const model = resolveWorkflowNodeModel(this.spec, role, node, provider);
+        const baseModel = resolveRoleModel(this.spec, role, provider);
+        if (model === baseModel) {
+          continue;
+        }
+
+        agents.set(
+          this.workflowNodeAgentId(node.id, role.id),
+          this.toClaudeAgentDefinition(role, { model }),
+        );
+      }
+    }
+
+    return Object.fromEntries(agents.entries());
   }
 
-  private toClaudeAgentDefinition(role: RoleSpec): AgentDefinition {
+  private toClaudeAgentDefinition(
+    role: RoleSpec,
+    overrides: { model?: string } = {},
+  ): AgentDefinition {
     return {
       description: role.agent.description,
       prompt: role.agent.prompt,
@@ -526,7 +650,9 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       ...(role.agent.disallowedTools
         ? { disallowedTools: role.agent.disallowedTools }
         : {}),
-      ...(role.agent.model ? { model: role.agent.model } : {}),
+      ...(overrides.model
+        ? { model: overrides.model }
+        : { model: resolveRoleModel(this.spec, role) }),
       ...(role.agent.skills ? { skills: role.agent.skills } : {}),
       ...(role.agent.mcpServers ? { mcpServers: role.agent.mcpServers } : {}),
       ...(role.agent.initialPrompt
@@ -544,9 +670,10 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
   }
 
   private buildRoleDispatchPrompt(role: RoleSpec, dispatch: TaskDispatch): string {
+    const agentId = this.resolveDispatchAgentId(role, dispatch);
     const lines = [
-      `Delegate this task to the ${role.id} agent using the Agent tool.`,
-      `Do not complete the task yourself. Do not answer directly without launching the ${role.id} agent first.`,
+      `Delegate this task to the ${agentId} agent using the Agent tool.`,
+      `Do not complete the task yourself. Do not answer directly without launching the ${agentId} agent first.`,
       `Dispatch ID: ${dispatch.dispatchId}`,
       `Role: ${role.name}`,
       `Role description: ${role.agent.description}`,
@@ -561,12 +688,49 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     }
 
     lines.push(
-      `After the ${role.id} agent finishes, relay its result with a concise completion summary that is easy for an orchestrator to pass along.`,
+      `After the ${agentId} agent finishes, relay its result with a concise completion summary that is easy for an orchestrator to pass along.`,
       'Task:',
       dispatch.instruction,
     );
 
     return lines.join('\n\n');
+  }
+
+  private resolveDispatchAgentId(role: RoleSpec, dispatch: TaskDispatch): string {
+    if (!dispatch.workflowNodeId) {
+      const baseModel = resolveRoleModel(this.spec, role);
+      if (dispatch.model && dispatch.model !== baseModel) {
+        throw new Error(
+          `ClaudeAgentWorkspace only supports per-dispatch model overrides through workflow node variants. Role "${role.id}" requested model "${dispatch.model}" outside workflow context.`,
+        );
+      }
+      return role.id;
+    }
+
+    const node = this.spec.workflow?.nodes.find(value => value.id === dispatch.workflowNodeId);
+    if (!node) {
+      return role.id;
+    }
+
+    const provider = resolveWorkflowNodeProvider(this.spec, role, node);
+    if (provider !== 'claude-agent-sdk') {
+      throw new Error(
+        `Workflow node "${node.id}" targets provider "${provider}", which ClaudeAgentWorkspace cannot execute.`,
+      );
+    }
+
+    const model = dispatch.model ?? resolveWorkflowNodeModel(this.spec, role, node, provider);
+    const baseModel = resolveRoleModel(this.spec, role, provider);
+    if (model === baseModel) {
+      return role.id;
+    }
+
+    const agentId = this.workflowNodeAgentId(node.id, role.id);
+    return agentId;
+  }
+
+  private workflowNodeAgentId(nodeId: string, roleId: string): string {
+    return `${roleId}__workflow__${nodeId}`;
   }
 
   private resolveCoordinatorRole(): RoleSpec {
@@ -692,13 +856,26 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
   }
 
   private handleResultMessage(message: Extract<SDKMessage, { type: 'result' }>): void {
-    const nextDispatchId = this.pendingResultDispatchQueue.shift();
+    const nextDispatchId =
+      this.pendingResultDispatchQueue.shift() ?? this.pendingDispatchQueue.shift();
     if (!nextDispatchId) {
       return;
     }
 
     const dispatch = this.state.dispatches[nextDispatchId];
-    if (!dispatch || message.subtype !== 'success' || typeof message.result !== 'string') {
+    if (!dispatch) {
+      return;
+    }
+
+    const isDirectCompletion =
+      !dispatch.providerTaskId &&
+      !dispatch.startedAt &&
+      dispatch.status === 'queued';
+    if (isDirectCompletion) {
+      this.finishDirectDispatch(dispatch, message);
+    }
+
+    if (message.subtype !== 'success' || typeof message.result !== 'string') {
       return;
     }
 
@@ -718,6 +895,52 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       resultText,
     };
     this.emitEvent(event);
+  }
+
+  private finishDirectDispatch(
+    dispatch: TaskDispatch,
+    message: Extract<SDKMessage, { type: 'result' }>,
+  ): void {
+    const directResult =
+      'result' in message && typeof message.result === 'string' ? message.result : '';
+    dispatch.status = message.subtype === 'success' ? 'completed' : 'failed';
+    dispatch.startedAt = dispatch.startedAt ?? new Date().toISOString();
+    dispatch.completedAt = new Date().toISOString();
+    dispatch.providerTaskId = message.session_id;
+    dispatch.toolUseId = dispatch.toolUseId ?? `claude-direct:${dispatch.dispatchId}`;
+    dispatch.lastSummary =
+      directResult.trim().length > 0
+        ? summarizeDirectResult(directResult)
+        : message.subtype === 'success'
+          ? 'Claude completed the task directly.'
+          : 'Claude failed before delegating the task.';
+
+    const completedEvent: DispatchCompletedEvent = {
+      type: dispatch.status === 'completed' ? 'dispatch.completed' : 'dispatch.failed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      dispatch: { ...dispatch },
+      taskId: dispatch.providerTaskId ?? '',
+      outputFile: dispatch.outputFile ?? '',
+      summary: dispatch.lastSummary,
+    };
+    this.emitEvent(completedEvent);
+    this.updateMemberState(
+      dispatch.roleId,
+      dispatch.status === 'completed' ? 'idle' : 'blocked',
+      dispatch.lastSummary,
+      dispatch.providerTaskId,
+    );
+    this.publishActivity(
+      dispatch.status === 'completed' ? 'member_delivered' : 'member_summary',
+      dispatch.lastSummary,
+      {
+        roleId: dispatch.roleId,
+        dispatchId: dispatch.dispatchId,
+        taskId: dispatch.providerTaskId,
+        visibility: dispatch.visibility ?? this.spec.activityPolicy?.defaultVisibility ?? 'public',
+      },
+    );
   }
 
   private handleAssistantMessage(
@@ -1280,7 +1503,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     );
   }
 
-  private async probeRoleClaim(
+  async probeRoleClaim(
     role: RoleSpec,
     request: WorkspaceTurnRequest,
     timeoutMs: number,
@@ -1304,7 +1527,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     const query = createClaudeQuery({
       prompt: claimPrompt,
       options: {
-        model: role.agent.model ?? this.spec.model,
+        model: resolveRoleModel(this.spec, role),
         ...(this.spec.cwd ? { cwd: this.spec.cwd } : {}),
         permissionMode: 'plan',
         tools: [],
@@ -1397,7 +1620,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     return parseWorkspaceClaimResponse(text, role, request);
   }
 
-  private async probeWorkflowVote(
+  async probeWorkflowVote(
     role: RoleSpec,
     request: WorkspaceTurnRequest,
     coordinatorDecision: CoordinatorWorkflowDecision,
@@ -1406,7 +1629,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     const query = createClaudeQuery({
       prompt: buildWorkflowVotePrompt(this.spec, role, request, coordinatorDecision),
       options: {
-        model: role.agent.model ?? this.spec.model,
+        model: resolveRoleModel(this.spec, role),
         ...(this.spec.cwd ? { cwd: this.spec.cwd } : {}),
         permissionMode: 'plan',
         tools: [],
@@ -1526,7 +1749,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     return response.text;
   }
 
-  private async requestCoordinatorDecision(
+  async requestCoordinatorDecision(
     request: WorkspaceTurnRequest,
     timeoutMs = 120_000,
   ): Promise<CoordinatorWorkflowDecision> {
@@ -1534,7 +1757,7 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
     const query = createClaudeQuery({
       prompt: buildCoordinatorDecisionPrompt(this.spec, request),
       options: {
-        model: coordinatorRole.agent.model ?? this.spec.model,
+        model: resolveRoleModel(this.spec, coordinatorRole),
         ...(this.spec.cwd ? { cwd: this.spec.cwd } : {}),
         permissionMode: 'plan',
         tools: [],
@@ -1643,6 +1866,76 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
       roleId: this.resolveCoordinatorRole().id,
       visibility: 'public',
     });
+  }
+
+  private enterWorkflowNode(node: { id: string; stageId?: string; title?: string }): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      mode: 'workflow_running',
+      activeNodeId: node.id,
+      ...(node.stageId ? { activeStageId: node.stageId } : {}),
+    };
+  }
+
+  private emitWorkflowStageStarted(stageId: string, node: { id: string; roleId?: string; reviewerRoleId?: string }): void {
+    const event: WorkflowStageEvent = {
+      type: 'workflow.stage.started',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_stage_started', `Workflow stage started: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private emitWorkflowStageCompleted(stageId: string, node: { id: string; roleId?: string; reviewerRoleId?: string }): void {
+    const event: WorkflowStageEvent = {
+      type: 'workflow.stage.completed',
+      timestamp: new Date().toISOString(),
+      workspaceId: this.spec.id,
+      nodeId: node.id,
+      stageId,
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+    };
+    this.emitEvent(event);
+    this.publishActivity('workflow_stage_completed', `Workflow stage completed: ${stageId}`, {
+      ...(node.roleId ? { roleId: node.roleId } : node.reviewerRoleId ? { roleId: node.reviewerRoleId } : {}),
+      visibility: 'public',
+    });
+  }
+
+  private finishWorkflowExecution(
+    status: 'done' | 'stuck' | 'discarded' | 'crash',
+    lastNode?: { id: string; title?: string; stageId?: string },
+  ): void {
+    this.state.workflowRuntime = {
+      mode: 'group_chat',
+      ...(this.state.workflowRuntime.worklists
+        ? { worklists: { ...this.state.workflowRuntime.worklists } }
+        : {}),
+    };
+    this.publishActivity(
+      'workflow_completed',
+      `Workflow ${status} at ${lastNode?.title ?? lastNode?.id ?? 'unknown node'}.`,
+      {
+        visibility: 'public',
+      },
+    );
+  }
+
+  private updateWorklistState(nodeId: string, worklist: WorkflowWorklistRuntimeState): void {
+    this.state.workflowRuntime = {
+      ...this.state.workflowRuntime,
+      worklists: {
+        ...(this.state.workflowRuntime.worklists ?? {}),
+        [nodeId]: worklist,
+      },
+    };
   }
 
   private emitCoordinatorSummary(text: string, roleId: string): void {
@@ -1830,4 +2123,12 @@ export class ClaudeAgentWorkspace extends WorkspaceRuntime {
         }
       });
   }
+}
+
+function summarizeDirectResult(text: string): string {
+  const normalized = text.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return 'Claude completed the task directly.';
+  }
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 157)}...`;
 }

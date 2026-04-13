@@ -5,6 +5,7 @@ export function createEdictGovernanceTemplate(): WorkspaceTemplate {
     templateId: 'edict-governance',
     templateName: 'Three Departments Six Ministries',
     description: 'A governance-style multi-agent workspace for coordinated planning, review, execution, and oversight.',
+    provider: 'claude-agent-sdk',
     defaultRoleId: 'shangshu',
     coordinatorRoleId: 'shangshu',
     orchestratorPrompt:
